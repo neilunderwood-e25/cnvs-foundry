@@ -2,8 +2,8 @@ import AppKit
 import SwiftUI
 
 struct WorkspaceView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = WorkspaceModel()
-    @State private var isLauncherPresented = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -18,19 +18,42 @@ struct WorkspaceView: View {
                 }
         }
         .background(Color(red: 0.035, green: 0.04, blue: 0.055))
-        .sheet(isPresented: $isLauncherPresented) {
-            AgentLauncherView(model: model)
+        .onDisappear {
+            model.persistWorkspace()
         }
-        .alert(
-            "Canvas Foundry",
-            isPresented: Binding(
-                get: { model.alertMessage != nil },
-                set: { if !$0 { model.alertMessage = nil } }
-            )
-        ) {
-            Button("OK", role: .cancel) { model.alertMessage = nil }
-        } message: {
-            Text(model.alertMessage ?? "")
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase != .active {
+                model.persistWorkspace()
+            }
+        }
+        .alert(item: $model.alertState) { state in
+            switch state {
+            case .message(let message):
+                Alert(
+                    title: Text("Canvas Foundry"),
+                    message: Text(message),
+                    dismissButton: .default(Text("OK"))
+                )
+            case .bootstrap(let request):
+                Alert(
+                    title: Text(
+                        request.shouldInitializeGit
+                            ? "Initialize Git Repository?"
+                            : "Create Initial Commit?"
+                    ),
+                    message: Text(
+                        request.shouldInitializeGit
+                            ? "Canvas Foundry will initialize this empty folder locally and create the first commit required for isolated worktrees."
+                            : "This repository has no commits. Canvas Foundry can create an empty initial commit so agents can use isolated worktrees."
+                    ),
+                    primaryButton: .default(
+                        Text(request.shouldInitializeGit ? "Initialize Locally" : "Create Commit")
+                    ) {
+                        model.initializeRepository(request)
+                    },
+                    secondaryButton: .cancel()
+                )
+            }
         }
     }
 
@@ -77,18 +100,21 @@ struct WorkspaceView: View {
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
 
-            Button {
-                if model.projectURL == nil {
-                    model.chooseProject()
-                } else {
-                    isLauncherPresented = true
+            if model.projectURL != nil {
+                Menu {
+                    ForEach(AgentProvider.allCases) { provider in
+                        Button {
+                            model.openTerminal(provider: provider)
+                        } label: {
+                            Label("Open \(provider.launchName)", systemImage: provider.symbolName)
+                        }
+                    }
+                } label: {
+                    Label("New Agent", systemImage: "plus")
                 }
-            } label: {
-                Label("New agent", systemImage: "plus")
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.orange)
-            .keyboardShortcut("n", modifiers: .command)
         }
         .padding(.horizontal, 18)
         .frame(height: 54)
@@ -109,7 +135,7 @@ private struct EmptyWorkspaceView: View {
                 .foregroundStyle(.orange)
             Text("Your agents need a place to build")
                 .font(.system(size: 24, weight: .semibold, design: .rounded))
-            Text("Choose a Git project. Every agent will get its own branch and worktree, then run independently on this canvas.")
+            Text("Choose a Git project or an empty folder to initialize locally. Every CLI agent gets its own branch and worktree.")
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 510)

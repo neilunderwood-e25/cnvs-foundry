@@ -2,29 +2,33 @@ import SwiftUI
 
 struct InfiniteCanvasView: View {
     @ObservedObject var model: WorkspaceModel
-    @State private var panOrigin: CGSize?
-    @State private var zoomOrigin: CGFloat?
+    @GestureState private var panTranslation = CGSize.zero
+    @GestureState private var magnification: CGFloat = 1
 
     var body: some View {
         GeometryReader { proxy in
             ZStack(alignment: .topLeading) {
-                CanvasGrid(zoom: model.zoom, pan: model.pan)
+                CanvasGrid(zoom: effectiveZoom, pan: effectivePan)
                     .contentShape(Rectangle())
                     .onTapGesture { model.select(nil) }
                     .gesture(panGesture)
                     .simultaneousGesture(zoomGesture)
 
-                ForEach(model.sessions) { session in
-                    AgentCardView(session: session, zoom: model.zoom) {
-                        model.select(session)
+                ZStack(alignment: .topLeading) {
+                    ForEach(model.sessions) { session in
+                        CanvasAgentNode(
+                            session: session,
+                            zoom: effectiveZoom,
+                            pan: model.pan
+                        ) {
+                            model.select(session)
+                        } onRelaunch: {
+                            model.relaunch(session)
+                        }
                     }
-                    .frame(width: 420, height: 300)
-                    .position(
-                        x: session.position.x * model.zoom + model.pan.width,
-                        y: session.position.y * model.zoom + model.pan.height
-                    )
-                    .scaleEffect(model.zoom, anchor: .center)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .offset(panTranslation)
 
                 canvasHint
                     .padding(18)
@@ -33,30 +37,48 @@ struct InfiniteCanvasView: View {
             .clipped()
             .accessibilityLabel("Agent canvas")
             .onDrop(of: [.fileURL], isTargeted: nil) { _ in false }
+            .onAppear { model.updateViewport(proxy.size) }
+            .onChange(of: proxy.size) { _, newSize in
+                model.updateViewport(newSize)
+            }
+            .transaction { transaction in
+                transaction.animation = nil
+            }
         }
     }
 
     private var panGesture: some Gesture {
         DragGesture(minimumDistance: 2)
-            .onChanged { value in
-                if panOrigin == nil { panOrigin = model.pan }
-                guard let panOrigin else { return }
+            .updating($panTranslation) { value, state, _ in
+                state = value.translation
+            }
+            .onEnded { value in
                 model.pan = CGSize(
-                    width: panOrigin.width + value.translation.width,
-                    height: panOrigin.height + value.translation.height
+                    width: model.pan.width + value.translation.width,
+                    height: model.pan.height + value.translation.height
                 )
             }
-            .onEnded { _ in panOrigin = nil }
     }
 
     private var zoomGesture: some Gesture {
         MagnificationGesture()
-            .onChanged { value in
-                if zoomOrigin == nil { zoomOrigin = model.zoom }
-                guard let zoomOrigin else { return }
-                model.zoom = min(1.8, max(0.45, zoomOrigin * value))
+            .updating($magnification) { value, state, _ in
+                state = value
             }
-            .onEnded { _ in zoomOrigin = nil }
+            .onEnded { value in
+                model.zoom = min(1.8, max(0.45, model.zoom * value))
+            }
+    }
+
+    private var effectivePan: CGSize {
+        CGSize(
+            width: model.pan.width + panTranslation.width,
+            height: model.pan.height + panTranslation.height
+        )
+    }
+
+    private var effectiveZoom: CGFloat {
+        min(1.8, max(0.45, model.zoom * magnification))
     }
 
     private var canvasHint: some View {
@@ -69,6 +91,44 @@ struct InfiniteCanvasView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.ultraThinMaterial, in: Capsule())
+    }
+}
+
+private struct CanvasAgentNode: View {
+    @ObservedObject var session: AgentSession
+    let zoom: CGFloat
+    let pan: CGSize
+    let onSelect: () -> Void
+    let onRelaunch: () -> Void
+
+    var body: some View {
+        NativeTerminalCardContainer(
+            content: AgentCardView(
+                session: session,
+                onSelect: onSelect,
+                onRelaunch: onRelaunch
+            ),
+            onInteractionBegan: onSelect,
+            onMoveEnded: { translation in
+                session.position = CGPoint(
+                    x: session.position.x + translation.width / zoom,
+                    y: session.position.y + translation.height / zoom
+                )
+            },
+            onResizeEnded: { newSize, centerShift in
+                session.size = newSize
+                session.position = CGPoint(
+                    x: session.position.x + centerShift.width / zoom,
+                    y: session.position.y + centerShift.height / zoom
+                )
+            }
+        )
+        .frame(width: session.size.width, height: session.size.height)
+        .position(
+            x: session.position.x * zoom + pan.width,
+            y: session.position.y * zoom + pan.height
+        )
+        .zIndex(session.isSelected ? 10 : 0)
     }
 }
 

@@ -1,16 +1,27 @@
 # Canvas Foundry
 
-Canvas Foundry is a native macOS workspace for running Claude Code and OpenAI Codex in parallel. Each agent receives an isolated Git branch and worktree, while its live output stays visible as a movable card on an infinite canvas.
+Canvas Foundry is a native macOS workspace for running interactive Claude Code and OpenAI Codex terminals in parallel. Each terminal receives an isolated Git branch and worktree, while the full CLI stays usable inside a movable card on an infinite canvas.
+
+## Core interaction model
+
+An agent is an interactive CLI terminal session, not a prompt form. After choosing a project, select **New Agent → Open Claude Code** or **Open Codex** and Canvas Foundry immediately creates a worktree and opens the real CLI. Prompts are typed directly into Claude or Codex.
 
 ## Current milestone
 
 The first vertical slice is functional:
 
 - Native SwiftUI macOS application with a zoomable, pannable canvas.
-- Git project picker.
-- Concurrent Claude Code and Codex agent sessions.
+- Git project picker with local initialization for empty folders and unborn repositories.
+- Concurrent, interactive Claude Code and Codex PTY sessions.
+- A unique, stable call sign for every Claude Code and Codex agent.
+- Durable project, canvas, and agent-card state restored between app launches.
+- Explicit relaunching of restored agents in their existing worktrees.
 - One automatically-created branch and worktree per session.
-- Live merged stdout/stderr streaming into draggable agent cards.
+- Full ANSI color, keyboard input, selection, scrolling, resizing, and terminal escape-sequence support.
+- Draggable and resizable terminal cards.
+- Collision-aware placement keeps newly opened terminals from covering existing cards.
+- Pixel-stable terminal surfaces keep text crisp and interaction responsive while the canvas pans or zooms.
+- Native AppKit card compositing keeps terminal dragging outside SwiftUI's render loop.
 - Honest lifecycle states: preparing, working, completed, stopped, and failed.
 - Stop controls and Finder reveal actions.
 
@@ -40,7 +51,7 @@ For every new session, Canvas Foundry:
 1. Resolves the selected repository root with `git rev-parse`.
 2. Creates a unique `canvas/<task>-<id>` branch from `HEAD`.
 3. Adds a worktree under `~/Library/Application Support/CanvasFoundry/Worktrees`.
-4. Starts the chosen CLI with that worktree as its current directory.
+4. Starts the chosen interactive CLI in a pseudo-terminal with that worktree as its current directory.
 
 Worktrees are not deleted automatically because they may contain uncommitted agent work.
 
@@ -51,17 +62,16 @@ SwiftUI workspace
 ├── Infinite canvas + draggable agent cards
 ├── WorkspaceModel (session orchestration)
 ├── GitWorktreeManager (branch/worktree isolation)
-└── AgentProcessController (CLI lifecycle + streamed output)
+└── AgentTerminalRuntime (PTY lifecycle + terminal emulation)
 ```
 
 ## Product roadmap
 
-### Milestone 2 — real terminal sessions
+### Milestone 2 — durable sessions
 
-- Replace pipe-only output with a PTY-backed terminal core.
-- Add interactive stdin and ANSI rendering.
 - Persist and restore canvases, cards, and sessions.
 - Detect installed agent CLIs and account state before launch.
+- Reconnect restored cards to surviving terminal sessions.
 
 ### Milestone 3 — fleet orchestration
 
@@ -85,4 +95,4 @@ SwiftUI workspace
 
 ## Safety boundary
 
-The app launches the agent CLIs in their normal non-interactive execution modes and does not add unsafe permission-bypass flags. Git worktree cleanup and branch deletion should remain explicit user actions in a later review UI.
+The app launches the agent CLIs in their normal interactive modes and does not add unsafe permission-bypass flags. Git worktree cleanup and branch deletion remain explicit user actions because worktrees may contain uncommitted work.

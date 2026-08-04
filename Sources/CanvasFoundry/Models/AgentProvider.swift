@@ -20,6 +20,13 @@ enum AgentProvider: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    var launchName: String {
+        switch self {
+        case .claude: "Claude Code"
+        case .codex: "Codex"
+        }
+    }
+
     var symbolName: String {
         switch self {
         case .claude: "sparkles"
@@ -27,12 +34,12 @@ enum AgentProvider: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    func launchPlan(prompt: String) -> AgentLaunchPlan {
+    func launchPlan() -> AgentLaunchPlan {
         switch self {
         case .claude:
-            AgentLaunchPlan(executable: "claude", arguments: ["--print", prompt])
+            AgentLaunchPlan(executable: "claude", arguments: [])
         case .codex:
-            AgentLaunchPlan(executable: "codex", arguments: ["exec", prompt])
+            AgentLaunchPlan(executable: "codex", arguments: [])
         }
     }
 }
