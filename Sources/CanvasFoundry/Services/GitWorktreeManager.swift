@@ -43,18 +43,18 @@ struct GitWorktreeManager: Sendable {
         self.storageRootOverride = storageRoot
     }
 
-    /// `<parent>/<project>-worktrees`: beside the project so branches are easy to
-    /// find and open next to the code, but outside it so they never appear in
-    /// `git status` and no linter, test runner or file watcher inside the project
-    /// ever walks into a second copy of the repository.
-    static func siblingContainer(forProjectRoot projectRoot: URL) -> URL {
+    /// `<project>/.foundry/worktrees`: inside the repository, the same pattern
+    /// Claude Code uses (`.claude/worktrees`). The container is written into
+    /// `.git/info/exclude` — machine-local, never committed — so the copies stay
+    /// invisible to `git status` in every checkout of this repo.
+    static func insideProjectContainer(forProjectRoot projectRoot: URL) -> URL {
         projectRoot
-            .deletingLastPathComponent()
-            .appendingPathComponent(
-                "\(projectRoot.lastPathComponent)-worktrees",
-                isDirectory: true
-            )
+            .appendingPathComponent(".foundry", isDirectory: true)
+            .appendingPathComponent("worktrees", isDirectory: true)
     }
+
+    /// Exclude pattern for the container, anchored to the repo root.
+    static let excludePattern = "/.foundry/"
 
     private func container(forProjectRoot projectRoot: URL) -> URL {
         if let storageRootOverride {
@@ -62,14 +62,52 @@ struct GitWorktreeManager: Sendable {
                 .appendingPathComponent(Self.repositoryKey(projectRoot), isDirectory: true)
         }
 
-        let sibling = Self.siblingContainer(forProjectRoot: projectRoot)
-        // A project in a read-only or otherwise unwritable parent still needs
-        // somewhere to keep its branches.
-        if FileManager.default.isWritableFile(atPath: sibling.deletingLastPathComponent().path) {
-            return sibling
+        // A read-only project root (unusual, but possible on mounted volumes)
+        // still needs somewhere to keep its branches.
+        if FileManager.default.isWritableFile(atPath: projectRoot.path) {
+            return Self.insideProjectContainer(forProjectRoot: projectRoot)
         }
         return Self.applicationSupportStorageRoot()
             .appendingPathComponent(Self.repositoryKey(projectRoot), isDirectory: true)
+    }
+
+    /// Appends the container to `.git/info/exclude` (creating it if needed)
+    /// unless a matching line is already there. Uses the *common* git dir so the
+    /// rule covers the main checkout and every worktree at once.
+    private func ensureContainerExcluded(projectRoot: URL) async throws {
+        let commonDirResult = try await shell.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            currentDirectoryURL: projectRoot
+        )
+        guard commonDirResult.exitCode == 0 else {
+            throw WorktreeError.commandFailed(Self.commandDetails(commonDirResult))
+        }
+
+        let commonDir = URL(
+            fileURLWithPath: commonDirResult.standardOutput
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            isDirectory: true
+        )
+        let infoDir = commonDir.appendingPathComponent("info", isDirectory: true)
+        let excludeURL = infoDir.appendingPathComponent("exclude", isDirectory: false)
+
+        let existing = (try? String(contentsOf: excludeURL, encoding: .utf8)) ?? ""
+        let lines = existing.split(separator: "\n").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        guard !lines.contains(Self.excludePattern) else { return }
+
+        try FileManager.default.createDirectory(
+            at: infoDir,
+            withIntermediateDirectories: true
+        )
+        var updated = existing
+        if !updated.isEmpty && !updated.hasSuffix("\n") {
+            updated += "\n"
+        }
+        updated += "# Canvas Foundry agent worktrees (machine-local)\n\(Self.excludePattern)\n"
+        try updated.write(to: excludeURL, atomically: true, encoding: .utf8)
     }
 
     static func repositoryKey(_ projectRoot: URL) -> String {
@@ -106,6 +144,11 @@ struct GitWorktreeManager: Sendable {
         let shortID = sessionID.uuidString.lowercased().prefix(8)
         let branchName = "canvas/\(Self.slug(title))-\(shortID)"
         let container = container(forProjectRoot: projectRoot)
+        if storageRootOverride == nil {
+            // Keeps the in-repo copies out of `git status` before the first
+            // worktree ever lands.
+            try await ensureContainerExcluded(projectRoot: projectRoot)
+        }
 
         // Named after the agent rather than a hash, so the folder is recognisable
         // in Finder and in an editor's window title.

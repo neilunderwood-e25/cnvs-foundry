@@ -908,9 +908,9 @@ final class CanvasFoundryTests: XCTestCase {
         XCTAssertEqual(session.status, .stopped)
     }
 
-    func testWorktreesLandBesideTheProjectWithReadableNames() async throws {
+    func testWorktreesLandInsideTheProjectLikeClaudeCode() async throws {
         let scratch = FileManager.default.temporaryDirectory
-            .appendingPathComponent("CanvasFoundrySibling-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("CanvasFoundryInside-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
 
         let repository = scratch.appendingPathComponent("acme-app", isDirectory: true)
@@ -933,7 +933,7 @@ final class CanvasFoundryTests: XCTestCase {
             currentDirectoryURL: repository
         )
 
-        // No storage override: the default must be `<parent>/acme-app-worktrees`.
+        // No storage override: the default must be `<project>/.foundry/worktrees`.
         let manager = GitWorktreeManager()
         let first = try await manager.createWorktree(
             for: repository,
@@ -943,9 +943,9 @@ final class CanvasFoundryTests: XCTestCase {
 
         XCTAssertEqual(
             first.worktreeURL.deletingLastPathComponent().resolvingSymlinksInPath().path,
-            scratch.appendingPathComponent("acme-app-worktrees", isDirectory: true)
+            repository.appendingPathComponent(".foundry/worktrees", isDirectory: true)
                 .resolvingSymlinksInPath().path,
-            "worktrees should sit in a sibling folder next to the project"
+            "worktrees should live inside the project, Claude Code style"
         )
         XCTAssertEqual(
             first.worktreeURL.lastPathComponent,
@@ -953,13 +953,40 @@ final class CanvasFoundryTests: XCTestCase {
             "folders should carry the agent name, not a hash"
         )
 
-        // The worktree must not leak into the project's own git status.
+        // In-repo copies are only safe if `.git/info/exclude` hides them:
+        // the project's own status must stay clean.
+        let excludeContents = try String(
+            contentsOf: repository.appendingPathComponent(".git/info/exclude"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(excludeContents.contains("/.foundry/"))
         let status = try await shell.run(
             executableURL: git,
             arguments: ["status", "--porcelain=v1"],
             currentDirectoryURL: repository
         )
         XCTAssertEqual(status.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines), "")
+
+        // The rule must not be duplicated by the next agent.
+        let second0 = try await manager.createWorktree(
+            for: repository,
+            sessionID: UUID(),
+            title: "Grace Codex"
+        )
+        let excludeAfterSecond = try String(
+            contentsOf: repository.appendingPathComponent(".git/info/exclude"),
+            encoding: .utf8
+        )
+        XCTAssertEqual(
+            excludeAfterSecond.components(separatedBy: "/.foundry/").count,
+            2,
+            "the exclude line should appear exactly once"
+        )
+        _ = try await shell.run(
+            executableURL: git,
+            arguments: ["worktree", "remove", "--force", second0.worktreeURL.path],
+            currentDirectoryURL: repository
+        )
 
         // A second agent with the same call sign must not collide.
         let second = try await manager.createWorktree(
