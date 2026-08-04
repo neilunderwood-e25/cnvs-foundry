@@ -1009,6 +1009,33 @@ final class CanvasFoundryTests: XCTestCase {
         )
     }
 
+    func testIsInsideComparesPathComponentsNotStringPrefixes() {
+        let parent = URL(fileURLWithPath: "/tmp/acme-app", isDirectory: true)
+
+        XCTAssertTrue(
+            IDEProjectOpener.isInside(
+                URL(fileURLWithPath: "/tmp/acme-app/.foundry/worktrees/ada-claude"),
+                of: parent
+            )
+        )
+        // The classic prefix bug: a sibling that merely shares the name prefix.
+        XCTAssertFalse(
+            IDEProjectOpener.isInside(
+                URL(fileURLWithPath: "/tmp/acme-app2/worktree"),
+                of: parent
+            )
+        )
+        // A folder is not inside itself.
+        XCTAssertFalse(IDEProjectOpener.isInside(parent, of: parent))
+        // Trailing slashes and `..` segments must not confuse the comparison.
+        XCTAssertTrue(
+            IDEProjectOpener.isInside(
+                URL(fileURLWithPath: "/tmp/acme-app/sub/../.foundry"),
+                of: URL(fileURLWithPath: "/tmp/acme-app/")
+            )
+        )
+    }
+
     func testAgentIDEWorkspacePairsProjectWithBranchWithoutClobbering() throws {
         let scratch = FileManager.default.temporaryDirectory
             .appendingPathComponent("CanvasFoundryWS-\(UUID().uuidString)", isDirectory: true)

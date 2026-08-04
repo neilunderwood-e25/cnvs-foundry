@@ -273,7 +273,7 @@ private struct FleetAgentRow: View {
                 Button("Publish Draft PR", action: onPreparePullRequest)
             }
             ForEach(installedIDEs) { ide in
-                Button("Open Branch + Project in \(ide.shortDisplayName)") {
+                Button("Open Project in \(ide.shortDisplayName)") {
                     onOpenInIDE(ide)
                 }
             }

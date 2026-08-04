@@ -174,6 +174,15 @@ enum IDEProjectOpener {
         }
     }
 
+    /// True when `child` lives underneath `parent`. Compared component-wise —
+    /// a raw string prefix would wrongly match `acme-app2` under `acme-app`.
+    static func isInside(_ child: URL, of parent: URL) -> Bool {
+        let childParts = child.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        let parentParts = parent.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        guard childParts.count > parentParts.count else { return false }
+        return Array(childParts.prefix(parentParts.count)) == parentParts
+    }
+
     static func makeMultiRootWorkspace(
         projectURL: URL,
         folders: [WorkspaceFolder],

@@ -324,23 +324,32 @@ final class WorkspaceModel: ObservableObject {
 
     func openAllActiveWorktrees(in ide: ProjectIDE) {
         guard let projectURL else { return }
-        let agentFolders = availableIDEWorktreeSessions.compactMap {
+        // In-repo worktrees come along with the project folder for free; only
+        // legacy ones created outside the repository need their own root.
+        let externalFolders = availableIDEWorktreeSessions.compactMap {
             session -> IDEProjectOpener.WorkspaceFolder? in
-            guard let worktreeURL = session.worktree?.worktreeURL else { return nil }
+            guard let worktreeURL = session.worktree?.worktreeURL,
+                  !IDEProjectOpener.isInside(worktreeURL, of: projectURL) else {
+                return nil
+            }
             return IDEProjectOpener.WorkspaceFolder(
                 name: "\(session.name) — \(session.provider.shortName)",
                 url: worktreeURL
             )
         }
-        let folders = [
-            IDEProjectOpener.WorkspaceFolder(
-                name: "Main — \(projectURL.lastPathComponent)",
-                url: projectURL
-            )
-        ] + agentFolders
 
         Task {
             do {
+                guard !externalFolders.isEmpty else {
+                    try await IDEProjectOpener.open(projectURL: projectURL, in: ide)
+                    return
+                }
+                let folders = [
+                    IDEProjectOpener.WorkspaceFolder(
+                        name: "Main — \(projectURL.lastPathComponent)",
+                        url: projectURL
+                    )
+                ] + externalFolders
                 let workspaceURL = try IDEProjectOpener.makeMultiRootWorkspace(
                     projectURL: projectURL,
                     folders: folders
@@ -356,9 +365,21 @@ final class WorkspaceModel: ObservableObject {
         guard let descriptor = session.worktree else { return }
         Task {
             do {
-                // Opened as one workspace holding the project and the agent's
-                // branch, so the editor's source control panel can stage, commit
-                // and open a PR on the branch without losing project context.
+                // Worktrees now live inside the project, so opening the project
+                // folder alone shows the codebase with the agent's branch in it.
+                if IDEProjectOpener.isInside(
+                    descriptor.worktreeURL,
+                    of: descriptor.projectRoot
+                ) {
+                    try await IDEProjectOpener.open(
+                        projectURL: descriptor.projectRoot,
+                        in: ide
+                    )
+                    return
+                }
+
+                // Legacy worktrees created outside the repository still need the
+                // two-root workspace to appear alongside the project.
                 let workspaceURL = try IDEProjectOpener.makeMultiRootWorkspace(
                     projectURL: descriptor.projectRoot,
                     folders: [
