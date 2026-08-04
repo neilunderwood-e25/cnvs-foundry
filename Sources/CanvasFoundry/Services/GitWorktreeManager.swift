@@ -34,11 +34,46 @@ enum WorktreeError: LocalizedError {
 }
 
 struct GitWorktreeManager: Sendable {
-    let storageRoot: URL
+    /// Explicit location, used by tests. When nil, worktrees are created beside
+    /// the project.
+    let storageRootOverride: URL?
     private let shell = ShellRunner()
 
-    init(storageRoot: URL = GitWorktreeManager.defaultStorageRoot()) {
-        self.storageRoot = storageRoot
+    init(storageRoot: URL? = nil) {
+        self.storageRootOverride = storageRoot
+    }
+
+    /// `<parent>/<project>-worktrees`: beside the project so branches are easy to
+    /// find and open next to the code, but outside it so they never appear in
+    /// `git status` and no linter, test runner or file watcher inside the project
+    /// ever walks into a second copy of the repository.
+    static func siblingContainer(forProjectRoot projectRoot: URL) -> URL {
+        projectRoot
+            .deletingLastPathComponent()
+            .appendingPathComponent(
+                "\(projectRoot.lastPathComponent)-worktrees",
+                isDirectory: true
+            )
+    }
+
+    private func container(forProjectRoot projectRoot: URL) -> URL {
+        if let storageRootOverride {
+            return storageRootOverride
+                .appendingPathComponent(Self.repositoryKey(projectRoot), isDirectory: true)
+        }
+
+        let sibling = Self.siblingContainer(forProjectRoot: projectRoot)
+        // A project in a read-only or otherwise unwritable parent still needs
+        // somewhere to keep its branches.
+        if FileManager.default.isWritableFile(atPath: sibling.deletingLastPathComponent().path) {
+            return sibling
+        }
+        return Self.applicationSupportStorageRoot()
+            .appendingPathComponent(Self.repositoryKey(projectRoot), isDirectory: true)
+    }
+
+    static func repositoryKey(_ projectRoot: URL) -> String {
+        "\(slug(projectRoot.lastPathComponent))-\(fnv1a(projectRoot.standardizedFileURL.path))"
     }
 
     func createWorktree(
@@ -70,13 +105,22 @@ struct GitWorktreeManager: Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let shortID = sessionID.uuidString.lowercased().prefix(8)
         let branchName = "canvas/\(Self.slug(title))-\(shortID)"
-        let repositoryKey = "\(Self.slug(projectRoot.lastPathComponent))-\(Self.fnv1a(projectRoot.path))"
-        let worktreeURL = storageRoot
-            .appendingPathComponent(repositoryKey, isDirectory: true)
-            .appendingPathComponent(String(shortID), isDirectory: true)
+        let container = container(forProjectRoot: projectRoot)
+
+        // Named after the agent rather than a hash, so the folder is recognisable
+        // in Finder and in an editor's window title.
+        let folderName = Self.slug(title)
+        var worktreeURL = container.appendingPathComponent(folderName, isDirectory: true)
+        if FileManager.default.fileExists(atPath: worktreeURL.path) {
+            // A reused call sign or a leftover directory must not collide.
+            worktreeURL = container.appendingPathComponent(
+                "\(folderName)-\(shortID)",
+                isDirectory: true
+            )
+        }
 
         try FileManager.default.createDirectory(
-            at: worktreeURL.deletingLastPathComponent(),
+            at: container,
             withIntermediateDirectories: true
         )
 
@@ -156,7 +200,8 @@ struct GitWorktreeManager: Sendable {
         return String(hash, radix: 16)
     }
 
-    static func defaultStorageRoot() -> URL {
+    /// Fallback for projects whose parent directory cannot be written to.
+    static func applicationSupportStorageRoot() -> URL {
         let applicationSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask

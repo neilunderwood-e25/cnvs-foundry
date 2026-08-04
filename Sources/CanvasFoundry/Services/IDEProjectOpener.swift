@@ -177,6 +177,9 @@ enum IDEProjectOpener {
     static func makeMultiRootWorkspace(
         projectURL: URL,
         folders: [WorkspaceFolder],
+        /// Distinguishes workspaces for the same repository — without it, opening
+        /// one agent would overwrite the file another agent's window is using.
+        variant: String? = nil,
         storageRoot: URL = defaultWorkspaceStorageRoot()
     ) throws -> URL {
         var seenPaths: Set<String> = []
@@ -193,9 +196,12 @@ enum IDEProjectOpener {
             at: storageRoot,
             withIntermediateDirectories: true
         )
-        let repositoryKey = "\(GitWorktreeManager.slug(projectURL.lastPathComponent))-\(GitWorktreeManager.fnv1a(projectURL.standardizedFileURL.path))"
+        var fileName = GitWorktreeManager.repositoryKey(projectURL)
+        if let variant {
+            fileName += "-\(variant)"
+        }
         let workspaceURL = storageRoot
-            .appendingPathComponent(repositoryKey, isDirectory: false)
+            .appendingPathComponent(fileName, isDirectory: false)
             .appendingPathExtension("code-workspace")
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
