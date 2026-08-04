@@ -15,9 +15,43 @@ struct GitCommitSummary: Equatable, Identifiable {
     var id: String { hash }
 }
 
+/// One entry of `git status --porcelain`, keeping both status columns so the
+/// review UI can stage and unstage like a Git client.
+struct GitWorkingFile: Equatable, Identifiable, Sendable {
+    /// Index (staged) column of the porcelain output.
+    let indexStatus: Character
+    /// Worktree (unstaged) column of the porcelain output.
+    let worktreeStatus: Character
+    let path: String
+
+    var id: String { path }
+
+    var isUntracked: Bool { indexStatus == "?" }
+    var hasStagedChanges: Bool {
+        indexStatus != " " && indexStatus != "?"
+    }
+    var hasUnstagedChanges: Bool {
+        worktreeStatus != " " || isUntracked
+    }
+    /// Fully staged: nothing left in the worktree column.
+    var isFullyStaged: Bool { hasStagedChanges && worktreeStatus == " " }
+
+    var statusLabel: String {
+        switch (indexStatus, worktreeStatus) {
+        case ("?", _): "untracked"
+        case ("A", _): "added"
+        case ("D", _), (_, "D"): "deleted"
+        case ("R", _): "renamed"
+        default: "modified"
+        }
+    }
+}
+
 struct GitReviewSnapshot: Equatable {
     let baseRevision: String
     let files: [GitChangedFile]
+    /// Uncommitted files, with staging state.
+    var workingFiles: [GitWorkingFile] = []
     let commits: [GitCommitSummary]
     let diff: String
 
@@ -133,9 +167,83 @@ struct GitReviewService: Sendable {
         return GitReviewSnapshot(
             baseRevision: baseRevision,
             files: files,
+            workingFiles: Self.parseWorkingFiles(statusResult.standardOutput),
             commits: Self.parseCommits(logResult.standardOutput),
             diff: diff
         )
+    }
+
+    // MARK: - Staging and committing
+
+    func stage(_ paths: [String], in descriptor: WorktreeDescriptor) async throws {
+        guard !paths.isEmpty else { return }
+        _ = try await runGit(["add", "--"] + paths, in: descriptor.worktreeURL)
+    }
+
+    func unstage(_ paths: [String], in descriptor: WorktreeDescriptor) async throws {
+        guard !paths.isEmpty else { return }
+        _ = try await runGit(
+            ["restore", "--staged", "--"] + paths,
+            in: descriptor.worktreeURL
+        )
+    }
+
+    func stageAll(in descriptor: WorktreeDescriptor) async throws {
+        _ = try await runGit(["add", "-A"], in: descriptor.worktreeURL)
+    }
+
+    /// Commits the staged changes in the agent worktree, falling back to a
+    /// placeholder identity when the repository has none configured.
+    func commit(message: String, in descriptor: WorktreeDescriptor) async throws {
+        let identityArguments = await gitIdentityArguments(descriptor.worktreeURL)
+        let result = try await shell.run(
+            executableURL: git,
+            arguments: identityArguments + ["commit", "-m", message],
+            currentDirectoryURL: descriptor.worktreeURL
+        )
+        guard result.exitCode == 0 else {
+            throw GitReviewError.commandFailed(Self.commandDetails(result))
+        }
+    }
+
+    /// Patch for a single file so the review pane can focus like a Git client.
+    /// Committed and unstaged changes are combined relative to the base;
+    /// untracked files are diffed against /dev/null so their content shows too.
+    func fileDiff(
+        _ descriptor: WorktreeDescriptor,
+        baseRevision: String,
+        file: GitWorkingFile?
+    ) async throws -> String {
+        guard let file else {
+            let result = try await runGit(
+                ["diff", "--no-ext-diff", "--no-color", baseRevision],
+                in: descriptor.worktreeURL
+            )
+            return result.standardOutput
+        }
+
+        if file.isUntracked {
+            // `diff --no-index` exits 1 when the files differ, which is the
+            // expected case here — only >1 is a real failure.
+            let result = try await shell.run(
+                executableURL: git,
+                arguments: [
+                    "diff", "--no-ext-diff", "--no-color", "--no-index",
+                    "--", "/dev/null", file.path
+                ],
+                currentDirectoryURL: descriptor.worktreeURL
+            )
+            guard result.exitCode <= 1 else {
+                throw GitReviewError.commandFailed(Self.commandDetails(result))
+            }
+            return result.standardOutput
+        }
+
+        let result = try await runGit(
+            ["diff", "--no-ext-diff", "--no-color", baseRevision, "--", file.path],
+            in: descriptor.worktreeURL
+        )
+        return result.standardOutput
     }
 
     func runTests(_ descriptor: WorktreeDescriptor) async throws -> AgentTestResult {
@@ -269,6 +377,23 @@ struct GitReviewService: Sendable {
             throw GitReviewError.commandFailed(Self.commandDetails(result))
         }
         return result
+    }
+
+    static func parseWorkingFiles(_ output: String) -> [GitWorkingFile] {
+        nonemptyLines(output).compactMap { line in
+            guard line.count >= 4 else { return nil }
+            let statusChars = Array(line.prefix(2))
+            var path = String(line.dropFirst(3))
+            if let renameRange = path.range(of: " -> ") {
+                path = String(path[renameRange.upperBound...])
+            }
+            return GitWorkingFile(
+                indexStatus: statusChars[0],
+                worktreeStatus: statusChars[1],
+                path: path
+            )
+        }
+        .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
     }
 
     private static func parseStatus(_ output: String) -> [GitChangedFile] {

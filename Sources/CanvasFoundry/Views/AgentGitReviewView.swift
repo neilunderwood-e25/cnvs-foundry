@@ -16,6 +16,12 @@ struct AgentGitReviewView: View {
     @State private var actionMessage: String?
     @State private var testOutput = ""
     @State private var pendingAction: PendingGitAction?
+    @State private var commitMessage = ""
+    @State private var isCommitting = false
+    @State private var isStaging = false
+    /// File focused in the patch pane; nil shows the whole patch.
+    @State private var selectedFile: GitWorkingFile?
+    @State private var focusedDiff: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -134,7 +140,9 @@ struct AgentGitReviewView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
                         reviewStats(snapshot)
-                        filesSection(snapshot.files)
+                        workingChangesSection(snapshot)
+                        commitComposerSection(snapshot)
+                        committedFilesSection(snapshot)
                         commitsSection(snapshot.commits)
                         integrationSection(snapshot)
                         if !testOutput.isEmpty {
@@ -143,13 +151,22 @@ struct AgentGitReviewView: View {
                     }
                     .padding(16)
                 }
-                .frame(minWidth: 300, idealWidth: 340, maxWidth: 420)
+                .frame(minWidth: 320, idealWidth: 380, maxWidth: 480)
 
                 VStack(alignment: .leading, spacing: 0) {
                     HStack {
-                        Text("PATCH")
+                        Text(selectedFile.map { patchTitle($0.path) } ?? "PATCH")
                             .font(.foundry(size: 10, weight: .bold))
                             .tracking(1)
+                            .lineLimit(1)
+                        if selectedFile != nil {
+                            Button("Show All") {
+                                selectedFile = nil
+                                focusedDiff = nil
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.foundry(size: 10))
+                        }
                         Spacer()
                         Text("base \(String(snapshot.baseRevision.prefix(8)))")
                             .font(.caption2.monospaced())
@@ -159,8 +176,8 @@ struct AgentGitReviewView: View {
                     .frame(height: 38)
                     Divider()
                     ScrollView([.horizontal, .vertical]) {
-                        Text(snapshot.diff)
-                            .font(.system(size: 10.5, design: .monospaced))
+                        Text(focusedDiff ?? snapshot.diff)
+                            .font(.system(size: 11, design: .monospaced))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                             .padding(14)
@@ -193,23 +210,204 @@ struct AgentGitReviewView: View {
         .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
     }
 
-    private func filesSection(_ files: [GitChangedFile]) -> some View {
-        reviewSection("CHANGED FILES") {
-            if files.isEmpty {
-                Text("No changed files")
+    // MARK: - Working changes (stage / unstage)
+
+    private func workingChangesSection(_ snapshot: GitReviewSnapshot) -> some View {
+        reviewSection("WORKING CHANGES") {
+            if snapshot.workingFiles.isEmpty {
+                Text("Worktree is clean — everything is committed.")
+                    .font(.foundry(size: 11))
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(files) { file in
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(file.status)
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
-                            .foregroundStyle(.orange)
-                            .frame(width: 54, alignment: .leading)
-                        Text(file.path)
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .lineLimit(2)
-                        Spacer(minLength: 0)
+                HStack {
+                    Button("Stage All") { runStaging { try await service.stageAll(in: $0) } }
+                        .disabled(isStaging || snapshot.workingFiles.allSatisfy(\.isFullyStaged))
+                    Button("Unstage All") {
+                        let paths = snapshot.workingFiles
+                            .filter(\.hasStagedChanges)
+                            .map(\.path)
+                        runStaging { try await service.unstage(paths, in: $0) }
                     }
+                    .disabled(isStaging || !snapshot.workingFiles.contains(where: \.hasStagedChanges))
+                    Spacer()
+                    Text("\(snapshot.workingFiles.filter(\.hasStagedChanges).count) staged")
+                        .font(.foundry(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .controlSize(.small)
+
+                ForEach(snapshot.workingFiles) { file in
+                    workingFileRow(file)
+                }
+            }
+        }
+    }
+
+    private func workingFileRow(_ file: GitWorkingFile) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Toggle(
+                "",
+                isOn: Binding(
+                    get: { file.isFullyStaged },
+                    set: { shouldStage in
+                        runStaging {
+                            if shouldStage {
+                                try await service.stage([file.path], in: $0)
+                            } else {
+                                try await service.unstage([file.path], in: $0)
+                            }
+                        }
+                    }
+                )
+            )
+            .toggleStyle(.checkbox)
+            .labelsHidden()
+            .disabled(isStaging)
+            .help(file.isFullyStaged ? "Unstage" : "Stage")
+
+            Button {
+                focus(on: file)
+            } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(file.statusLabel)
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundStyle(statusColor(for: file))
+                        .frame(width: 62, alignment: .leading)
+                    Text(file.path)
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(2)
+                        .foregroundStyle(
+                            selectedFile?.path == file.path ? Color.accentColor : .primary
+                        )
+                    if file.hasStagedChanges && file.hasUnstagedChanges {
+                        Text("partial")
+                            .font(.foundry(size: 8.5, weight: .bold))
+                            .foregroundStyle(.yellow)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Show this file's diff")
+        }
+    }
+
+    private func statusColor(for file: GitWorkingFile) -> Color {
+        switch file.statusLabel {
+        case "untracked", "added": .green
+        case "deleted": .red
+        case "renamed": .cyan
+        default: .orange
+        }
+    }
+
+    // MARK: - Commit composer
+
+    private func commitComposerSection(_ snapshot: GitReviewSnapshot) -> some View {
+        let stagedFiles = snapshot.workingFiles.filter(\.hasStagedChanges)
+        return reviewSection("COMMIT") {
+            if snapshot.workingFiles.isEmpty {
+                EmptyView()
+            } else {
+                TextEditor(text: $commitMessage)
+                    .font(.system(size: 11, design: .monospaced))
+                    .scrollContentBackground(.hidden)
+                    .frame(height: 74)
+                    .padding(6)
+                    .background(Color.black.opacity(0.24), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(alignment: .topLeading) {
+                        if commitMessage.isEmpty {
+                            Text("Commit message")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .padding(.top, 10)
+                                .padding(.leading, 11)
+                                .allowsHitTesting(false)
+                        }
+                    }
+
+                HStack {
+                    Button {
+                        // Describe what will actually be committed: the staged
+                        // set, or everything if nothing is staged yet.
+                        let described = stagedFiles.isEmpty
+                            ? snapshot.workingFiles
+                            : stagedFiles
+                        commitMessage = CommitMessageComposer.compose(for: described)
+                    } label: {
+                        Label("Generate", systemImage: "wand.and.stars")
+                    }
+                    .disabled(snapshot.workingFiles.isEmpty)
+                    .help("Generate a commit message from the changed files")
+
+                    Spacer()
+
+                    Button {
+                        commitStaged(snapshot)
+                    } label: {
+                        if isCommitting {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Label(
+                                stagedFiles.isEmpty
+                                    ? "Stage All & Commit"
+                                    : "Commit \(stagedFiles.count) File\(stagedFiles.count == 1 ? "" : "s")",
+                                systemImage: "checkmark.seal"
+                            )
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                    .disabled(
+                        isCommitting || isStaging
+                            || commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
+                }
+                .controlSize(.small)
+            }
+        }
+    }
+
+    // MARK: - Committed files
+
+    private func committedFilesSection(_ snapshot: GitReviewSnapshot) -> some View {
+        let workingPaths = Set(snapshot.workingFiles.map(\.path))
+        let committed = snapshot.files.filter { !workingPaths.contains($0.path) }
+        return reviewSection("COMMITTED FILES") {
+            if committed.isEmpty {
+                Text("Nothing committed beyond the base revision yet.")
+                    .font(.foundry(size: 11))
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(committed) { file in
+                    Button {
+                        focus(
+                            on: GitWorkingFile(
+                                indexStatus: " ",
+                                worktreeStatus: " ",
+                                path: file.path
+                            )
+                        )
+                    } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Image(systemName: "checkmark.circle")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.cyan)
+                            Text(file.path)
+                                .font(.system(size: 11, design: .monospaced))
+                                .lineLimit(2)
+                                .foregroundStyle(
+                                    selectedFile?.path == file.path
+                                        ? Color.accentColor
+                                        : .primary
+                                )
+                            Spacer(minLength: 0)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Show this file's diff")
                 }
             }
         }
@@ -336,8 +534,93 @@ struct AgentGitReviewView: View {
             let loaded = try await service.inspect(descriptor)
             snapshot = loaded
             session.gitSummary = loaded.summary
+
+            // Keep the focused diff in step with the reloaded state; drop the
+            // selection when the file no longer changes anything.
+            if let current = selectedFile {
+                if loaded.files.contains(where: { $0.path == current.path }) {
+                    let refreshed = loaded.workingFiles.first {
+                        $0.path == current.path
+                    } ?? current
+                    focus(on: refreshed)
+                } else {
+                    selectedFile = nil
+                    focusedDiff = nil
+                }
+            }
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    private func patchTitle(_ path: String) -> String {
+        (path as NSString).lastPathComponent.uppercased()
+    }
+
+    private func focus(on file: GitWorkingFile) {
+        guard let descriptor = session.worktree, let snapshot else { return }
+        selectedFile = file
+        Task {
+            do {
+                let diff = try await service.fileDiff(
+                    descriptor,
+                    baseRevision: snapshot.baseRevision,
+                    file: file
+                )
+                let trimmed = diff.trimmingCharacters(in: .whitespacesAndNewlines)
+                focusedDiff = trimmed.isEmpty
+                    ? "No textual changes in \(file.path)."
+                    : GitReviewService.truncated(
+                        diff,
+                        maximumCharacters: 2_000_000,
+                        label: "Patch"
+                    )
+            } catch {
+                focusedDiff = "Could not load the diff for \(file.path):\n\(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Runs a staging mutation, then re-inspects so checkboxes reflect git's
+    /// actual state rather than an optimistic guess.
+    private func runStaging(_ operation: @escaping (WorktreeDescriptor) async throws -> Void) {
+        guard let descriptor = session.worktree else { return }
+        isStaging = true
+        errorMessage = nil
+        Task {
+            defer { isStaging = false }
+            do {
+                try await operation(descriptor)
+                await loadReview()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func commitStaged(_ snapshot: GitReviewSnapshot) {
+        guard let descriptor = session.worktree else { return }
+        let message = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return }
+        let mustStageEverything = !snapshot.workingFiles.contains(where: \.hasStagedChanges)
+
+        isCommitting = true
+        errorMessage = nil
+        actionMessage = nil
+        Task {
+            defer { isCommitting = false }
+            do {
+                if mustStageEverything {
+                    try await service.stageAll(in: descriptor)
+                }
+                try await service.commit(message: message, in: descriptor)
+                commitMessage = ""
+                actionMessage = "Committed to \(descriptor.branchName). Publish or push the PR to share it."
+                onRepositoryChanged()
+                await loadReview()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 

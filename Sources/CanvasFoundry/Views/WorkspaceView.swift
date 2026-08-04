@@ -127,7 +127,17 @@ struct WorkspaceView: View {
                 onOpenPullRequest: { model.openPullRequest(session) },
                 onPushPullRequestUpdates: { model.pushPullRequestUpdates(session) }
             )
-            .frame(minWidth: 940, minHeight: 680)
+            // Flexible upper bounds make the sheet resizable; ideal sizes open
+            // it large enough to review a real diff without immediately
+            // reaching for the resize handle.
+            .frame(
+                minWidth: 1000,
+                idealWidth: 1360,
+                maxWidth: .infinity,
+                minHeight: 660,
+                idealHeight: 880,
+                maxHeight: .infinity
+            )
         }
         .sheet(isPresented: $isReviewQueuePresented) {
             PullRequestReviewQueueView(model: model)

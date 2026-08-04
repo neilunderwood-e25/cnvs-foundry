@@ -1019,6 +1019,149 @@ final class CanvasFoundryTests: XCTestCase {
         )
     }
 
+    func testWorkingFileParsingTracksBothStatusColumns() {
+        let files = GitReviewService.parseWorkingFiles(
+            """
+            M  staged.swift
+             M unstaged.swift
+            MM partial.swift
+            ?? brand-new.swift
+            R  old.swift -> renamed.swift
+            """
+        )
+        let byPath = Dictionary(uniqueKeysWithValues: files.map { ($0.path, $0) })
+
+        XCTAssertEqual(byPath["staged.swift"]?.isFullyStaged, true)
+        XCTAssertEqual(byPath["unstaged.swift"]?.hasStagedChanges, false)
+        XCTAssertEqual(byPath["unstaged.swift"]?.hasUnstagedChanges, true)
+        // Partially staged files must read as both, or the checkbox lies.
+        XCTAssertEqual(byPath["partial.swift"]?.hasStagedChanges, true)
+        XCTAssertEqual(byPath["partial.swift"]?.hasUnstagedChanges, true)
+        XCTAssertEqual(byPath["partial.swift"]?.isFullyStaged, false)
+        XCTAssertEqual(byPath["brand-new.swift"]?.isUntracked, true)
+        XCTAssertEqual(byPath["brand-new.swift"]?.statusLabel, "untracked")
+        XCTAssertEqual(byPath["renamed.swift"]?.statusLabel, "renamed")
+    }
+
+    func testCommitMessageComposerDescribesTheStagedSet() {
+        func file(_ index: Character, _ tree: Character, _ path: String) -> GitWorkingFile {
+            GitWorkingFile(indexStatus: index, worktreeStatus: tree, path: path)
+        }
+
+        XCTAssertEqual(CommitMessageComposer.compose(for: []), "")
+        XCTAssertEqual(
+            CommitMessageComposer.compose(for: [file("M", " ", "app/page.tsx")]),
+            "Update page.tsx"
+        )
+        XCTAssertEqual(
+            CommitMessageComposer.compose(for: [file("?", "?", "app/new.tsx")]),
+            "Add new.tsx"
+        )
+
+        let multi = CommitMessageComposer.compose(for: [
+            file("M", " ", "app/page.tsx"),
+            file("M", " ", "app/layout.tsx"),
+            file("M", " ", "lib/util.ts")
+        ])
+        XCTAssertTrue(multi.hasPrefix("Update app and lib (3 files)"), multi)
+        XCTAssertTrue(multi.contains("- modified: app/page.tsx"))
+        XCTAssertTrue(multi.contains("- modified: lib/util.ts"))
+
+        let mixed = CommitMessageComposer.compose(for: [
+            file("A", " ", "Tests/NewTests.swift"),
+            file("M", " ", "Sources/Thing.swift")
+        ])
+        XCTAssertTrue(mixed.hasPrefix("Update Sources and Tests (2 files)"), mixed)
+    }
+
+    func testStageCommitRoundTripOnARealWorktree() async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CanvasFoundryCommit-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+
+        let repository = scratch.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+        let shell = ShellRunner()
+        let git = URL(fileURLWithPath: "/usr/bin/git")
+        for arguments in [
+            ["init", "-b", "main"],
+            [
+                "-c", "user.name=Canvas Foundry Tests",
+                "-c", "user.email=tests@canvas.invalid",
+                "commit", "--allow-empty", "-m", "Initial commit"
+            ]
+        ] {
+            let result = try await shell.run(
+                executableURL: git,
+                arguments: arguments,
+                currentDirectoryURL: repository
+            )
+            XCTAssertEqual(result.exitCode, 0, result.standardError)
+        }
+
+        let manager = GitWorktreeManager(
+            storageRoot: scratch.appendingPathComponent("worktrees", isDirectory: true)
+        )
+        let descriptor = try await manager.createWorktree(
+            for: repository,
+            sessionID: UUID(),
+            title: "Ada Claude"
+        )
+
+        // Agent leaves uncommitted work behind, like the real review scenario.
+        try Data("let feature = true\n".utf8).write(
+            to: descriptor.worktreeURL.appendingPathComponent("feature.swift")
+        )
+        try Data("let extra = 1\n".utf8).write(
+            to: descriptor.worktreeURL.appendingPathComponent("extra.swift")
+        )
+
+        let service = GitReviewService()
+        var snapshot = try await service.inspect(descriptor)
+        XCTAssertEqual(snapshot.workingFiles.count, 2)
+        XCTAssertTrue(snapshot.commits.isEmpty)
+        XCTAssertTrue(snapshot.workingFiles.allSatisfy(\.isUntracked))
+
+        // Untracked files still show reviewable content in the focused diff.
+        let untrackedDiff = try await service.fileDiff(
+            descriptor,
+            baseRevision: snapshot.baseRevision,
+            file: snapshot.workingFiles[0]
+        )
+        XCTAssertTrue(untrackedDiff.contains("+let extra = 1"), untrackedDiff)
+
+        // Stage one file, commit it, and the review must show one commit and
+        // one remaining working file.
+        try await service.stage(["feature.swift"], in: descriptor)
+        snapshot = try await service.inspect(descriptor)
+        XCTAssertEqual(
+            snapshot.workingFiles.first { $0.path == "feature.swift" }?.isFullyStaged,
+            true
+        )
+
+        let message = CommitMessageComposer.compose(
+            for: snapshot.workingFiles.filter(\.hasStagedChanges)
+        )
+        XCTAssertEqual(message, "Add feature.swift")
+        try await service.commit(message: message, in: descriptor)
+
+        snapshot = try await service.inspect(descriptor)
+        XCTAssertEqual(snapshot.commits.map(\.subject), ["Add feature.swift"])
+        XCTAssertEqual(snapshot.workingFiles.map(\.path), ["extra.swift"])
+
+        // Unstage must round-trip too.
+        try await service.stage(["extra.swift"], in: descriptor)
+        try await service.unstage(["extra.swift"], in: descriptor)
+        snapshot = try await service.inspect(descriptor)
+        XCTAssertEqual(snapshot.workingFiles.first?.hasStagedChanges, false)
+
+        _ = try await shell.run(
+            executableURL: git,
+            arguments: ["worktree", "remove", "--force", descriptor.worktreeURL.path],
+            currentDirectoryURL: repository
+        )
+    }
+
     func testEditorSettingsGainScanDepthWithoutClobberingExistingConfig() throws {
         let scratch = FileManager.default.temporaryDirectory
             .appendingPathComponent("CanvasFoundryVSCode-\(UUID().uuidString)", isDirectory: true)
