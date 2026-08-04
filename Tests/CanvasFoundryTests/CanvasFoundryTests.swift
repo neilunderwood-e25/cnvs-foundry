@@ -1162,6 +1162,130 @@ final class CanvasFoundryTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testMergedPullRequestCleansUpAgentUnlessWorktreeIsDirty() async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CanvasFoundryMergeClean-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let repository = scratch.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+        let shell = ShellRunner()
+        let git = URL(fileURLWithPath: "/usr/bin/git")
+        for arguments in [
+            ["init", "-b", "main"],
+            [
+                "-c", "user.name=Canvas Foundry Tests",
+                "-c", "user.email=tests@canvas.invalid",
+                "commit", "--allow-empty", "-m", "Initial commit"
+            ]
+        ] {
+            _ = try await shell.run(
+                executableURL: git,
+                arguments: arguments,
+                currentDirectoryURL: repository
+            )
+        }
+
+        let manager = GitWorktreeManager(
+            storageRoot: scratch.appendingPathComponent("worktrees", isDirectory: true)
+        )
+        let model = WorkspaceModel(
+            worktreeManager: manager,
+            persistence: WorkspacePersistence(
+                fileURL: scratch.appendingPathComponent("workspace.json")
+            )
+        )
+
+        func mergedPR(_ number: Int) -> AgentPullRequest {
+            AgentPullRequest(
+                number: number,
+                url: URL(string: "https://github.com/example/project/pull/\(number)")!,
+                state: .merged,
+                isDraft: false,
+                headBranch: "canvas/test",
+                baseBranch: "main",
+                updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+                title: "Test",
+                mergeability: .mergeable,
+                mergeStateStatus: "CLEAN",
+                checksStatus: .passed,
+                reviewDecision: .approved,
+                headCommitOID: "abc123",
+                changedFiles: 1,
+                additions: 1,
+                deletions: 0,
+                checks: []
+            )
+        }
+
+        // Clean worktree: cleanup removes the worktree and archives the agent.
+        let cleanDescriptor = try await manager.createWorktree(
+            for: repository, sessionID: UUID(), title: "Ada Claude"
+        )
+        let cleanSession = AgentSession(provider: .claude, name: "Ada", position: .zero)
+        cleanSession.worktree = cleanDescriptor
+        cleanSession.pullRequest = mergedPR(7)
+        model.sessions.append(cleanSession)
+
+        await model.cleanUpMergedSession(cleanSession)
+        XCTAssertTrue(cleanSession.isArchived)
+        XCTAssertEqual(cleanSession.status, .completed)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: cleanDescriptor.worktreeURL.path),
+            "a clean worktree should be deleted once its PR is merged"
+        )
+
+        // Dirty worktree: preserved, agent flagged, nothing destroyed.
+        let dirtyDescriptor = try await manager.createWorktree(
+            for: repository, sessionID: UUID(), title: "Grace Codex"
+        )
+        try Data("half-finished\n".utf8).write(
+            to: dirtyDescriptor.worktreeURL.appendingPathComponent("leftover.txt")
+        )
+        let dirtySession = AgentSession(provider: .codex, name: "Grace", position: .zero)
+        dirtySession.worktree = dirtyDescriptor
+        dirtySession.pullRequest = mergedPR(8)
+        model.sessions.append(dirtySession)
+
+        await model.cleanUpMergedSession(dirtySession)
+        XCTAssertFalse(dirtySession.isArchived)
+        XCTAssertEqual(dirtySession.status, .needsYou("PR merged; uncommitted work remains"))
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: dirtyDescriptor.worktreeURL.appendingPathComponent("leftover.txt").path
+            ),
+            "uncommitted work must never be destroyed silently"
+        )
+
+        // An open PR must never trigger cleanup.
+        let openSession = AgentSession(provider: .claude, name: "Alan", position: .zero)
+        openSession.worktree = dirtyDescriptor
+        openSession.pullRequest = {
+            var pullRequest = mergedPR(9)
+            return AgentPullRequest(
+                number: pullRequest.number, url: pullRequest.url, state: .open,
+                isDraft: true, headBranch: pullRequest.headBranch,
+                baseBranch: pullRequest.baseBranch, updatedAt: pullRequest.updatedAt,
+                title: pullRequest.title, mergeability: pullRequest.mergeability,
+                mergeStateStatus: pullRequest.mergeStateStatus,
+                checksStatus: pullRequest.checksStatus,
+                reviewDecision: pullRequest.reviewDecision,
+                headCommitOID: pullRequest.headCommitOID,
+                changedFiles: pullRequest.changedFiles,
+                additions: pullRequest.additions,
+                deletions: pullRequest.deletions, checks: pullRequest.checks
+            )
+        }()
+        await model.cleanUpMergedSession(openSession)
+        XCTAssertFalse(openSession.isArchived, "open PRs are still in progress")
+
+        _ = try await shell.run(
+            executableURL: git,
+            arguments: ["worktree", "remove", "--force", dirtyDescriptor.worktreeURL.path],
+            currentDirectoryURL: repository
+        )
+    }
+
     func testEditorSettingsGainScanDepthWithoutClobberingExistingConfig() throws {
         let scratch = FileManager.default.temporaryDirectory
             .appendingPathComponent("CanvasFoundryVSCode-\(UUID().uuidString)", isDirectory: true)

@@ -9,7 +9,8 @@ struct AgentGitReviewView: View {
     let onPushPullRequestUpdates: () -> Void
     /// Re-reads the PR from GitHub so a merge done in the browser shows here.
     let onRefreshPullRequest: () -> Void
-    let onArchive: () -> Void
+    /// Guarded worktree deletion for the merged-but-dirty case.
+    let onDelete: () -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var snapshot: GitReviewSnapshot?
@@ -181,31 +182,43 @@ struct AgentGitReviewView: View {
         }
     }
 
-    /// Shown once the PR is merged: this sheet's work is done, so the only
-    /// sensible action left is tidying up the agent.
+    private var worktreeStillOnDisk: Bool {
+        guard let path = session.worktree?.worktreeURL.path else { return false }
+        return FileManager.default.fileExists(atPath: path)
+    }
+
+    /// Shown once the PR is merged. Cleanup is automatic when the worktree is
+    /// clean; this section reports it, or offers the guarded delete when
+    /// uncommitted leftovers stopped the automatic pass.
     private var mergedSection: some View {
         reviewSection("MERGED") {
             VStack(alignment: .leading, spacing: 10) {
                 Label(
-                    "\(session.pullRequest?.displayLabel ?? "The pull request") was merged. This branch is integrated.",
+                    "\(session.pullRequest?.displayLabel ?? "The pull request") was merged. This branch's work is done.",
                     systemImage: "checkmark.seal.fill"
                 )
                 .font(.foundry(size: 11.5))
                 .foregroundStyle(.purple)
 
-                Button {
-                    dismiss()
-                    onArchive()
-                } label: {
-                    Label("Archive Agent", systemImage: "archivebox")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.purple)
+                if worktreeStillOnDisk {
+                    Text("The worktree was kept because it still has uncommitted changes. Deleting it discards them permanently.")
+                        .font(.foundry(size: 10.5))
+                        .foregroundStyle(.secondary)
 
-                Text("Archiving keeps the card in the sidebar. Deleting the worktree is available from the agent's menu.")
-                    .font(.foundry(size: 10))
-                    .foregroundStyle(.secondary)
+                    Button {
+                        dismiss()
+                        onDelete()
+                    } label: {
+                        Label("Delete Worktree…", systemImage: "trash")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+                } else {
+                    Text("Worktree removed and agent archived. Start the next task with a fresh agent — it will branch from the merged code.")
+                        .font(.foundry(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(12)
             .background(.purple.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))

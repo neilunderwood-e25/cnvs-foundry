@@ -511,7 +511,14 @@ final class WorkspaceModel: ObservableObject {
         Task {
             defer { session.isPublishingPullRequest = false }
             do {
-                session.pullRequest = try await pullRequestService.refresh(descriptor)
+                let wasMerged = session.pullRequest?.state == .merged
+                let refreshed = try await pullRequestService.refresh(descriptor)
+                session.pullRequest = refreshed
+                // A user or reviewer merging on GitHub ends this branch's work
+                // just as much as Foundry's own merge button does.
+                if !wasMerged, refreshed.state == .merged, !session.isArchived {
+                    await cleanUpMergedSession(session)
+                }
             } catch {
                 if reportErrors {
                     reviewQueueNotice = error.localizedDescription
@@ -584,26 +591,7 @@ final class WorkspaceModel: ObservableObject {
                     reviewQueueNotice = "GitHub accepted PR #\(merged.number) for merging, but it is still open. The agent and worktree were preserved while GitHub finishes its merge queue."
                     return
                 }
-                session.runtime?.stop(preservingSessionStatus: true)
-
-                let hasChanges = try await worktreeManager.hasUncommittedChanges(descriptor)
-                if hasChanges {
-                    session.status = .needsYou("PR merged; uncommitted work remains")
-                    reviewQueueNotice = "Merged PR #\(merged.number). \(session.name)’s worktree was preserved because it still has uncommitted changes."
-                } else {
-                    do {
-                        try await worktreeManager.removeWorktree(descriptor, force: false)
-                        session.status = .completed
-                        session.isArchived = true
-                        if selectedSessionID == session.id {
-                            select(nil)
-                        }
-                        reviewQueueNotice = "Merged PR #\(merged.number) and archived \(session.name). The Git branch was preserved."
-                    } catch {
-                        session.status = .completed
-                        reviewQueueNotice = "Merged PR #\(merged.number), but the worktree could not be removed: \(error.localizedDescription)"
-                    }
-                }
+                await cleanUpMergedSession(session)
 
                 for candidate in sessions where candidate.id != session.id
                     && !candidate.isArchived && candidate.pullRequest?.state == .open {
@@ -612,6 +600,41 @@ final class WorkspaceModel: ObservableObject {
             } catch {
                 reviewQueueNotice = error.localizedDescription
             }
+        }
+    }
+
+    /// A merged PR ends the branch's life: one branch, one PR, one unit of
+    /// work. Reusing the branch after a squash merge would make the next PR
+    /// re-show already-merged changes, so the runtime stops and — when the
+    /// worktree is clean — the worktree is deleted and the agent archived.
+    /// Uncommitted leftovers are never destroyed silently; the agent flips to
+    /// "needs you" instead, and deletion stays behind the guarded confirm.
+    func cleanUpMergedSession(_ session: AgentSession) async {
+        guard let descriptor = session.worktree,
+              let pullRequest = session.pullRequest,
+              pullRequest.state == .merged else {
+            return
+        }
+        session.runtime?.stop(preservingSessionStatus: true)
+
+        let hasChanges = (try? await worktreeManager.hasUncommittedChanges(descriptor)) ?? true
+        guard !hasChanges else {
+            session.status = .needsYou("PR merged; uncommitted work remains")
+            reviewQueueNotice = "Merged PR #\(pullRequest.number). \(session.name)’s worktree was preserved because it still has uncommitted changes."
+            return
+        }
+
+        do {
+            try await worktreeManager.removeWorktree(descriptor, force: false)
+            session.status = .completed
+            session.isArchived = true
+            if selectedSessionID == session.id {
+                select(nil)
+            }
+            reviewQueueNotice = "Merged PR #\(pullRequest.number): archived \(session.name) and removed the worktree. The Git branch was preserved."
+        } catch {
+            session.status = .completed
+            reviewQueueNotice = "Merged PR #\(pullRequest.number), but the worktree could not be removed: \(error.localizedDescription)"
         }
     }
 
