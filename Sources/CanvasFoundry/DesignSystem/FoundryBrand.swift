@@ -40,15 +40,60 @@ enum FoundryBrand {
     }
 
     static func applyApplicationIcon() {
+        NSApp.applicationIconImage = appIconImage
+    }
+
+    static let appIconImage: NSImage? = {
         guard let iconURL = resourceURL(
             named: "Foundry-App-Icon",
             extension: "svg",
             subdirectory: "Brand"
-        ), let icon = NSImage(contentsOf: iconURL) else {
-            return
+        ), let sourceImage = NSImage(contentsOf: iconURL) else {
+            return nil
         }
-        NSApp.applicationIconImage = icon
-    }
+
+        let canvasSize = NSSize(width: 512, height: 512)
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(canvasSize.width),
+            pixelsHigh: Int(canvasSize.height),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ), let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
+            return nil
+        }
+
+        bitmap.size = canvasSize
+        let canvasRect = NSRect(origin: .zero, size: canvasSize)
+        let iconRect = canvasRect.insetBy(dx: 24, dy: 24)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        context.imageInterpolation = .high
+        NSColor.clear.setFill()
+        NSBezierPath(rect: canvasRect).fill()
+        NSBezierPath(
+            roundedRect: iconRect,
+            xRadius: 108,
+            yRadius: 108
+        ).addClip()
+        sourceImage.draw(
+            in: iconRect,
+            from: .zero,
+            operation: .sourceOver,
+            fraction: 1
+        )
+        NSGraphicsContext.restoreGraphicsState()
+
+        let image = NSImage(size: canvasSize)
+        image.addRepresentation(bitmap)
+        image.isTemplate = false
+        return image
+    }()
 
     static var markImage: NSImage? {
         guard let url = resourceURL(
@@ -83,22 +128,24 @@ extension Font {
     }
 }
 
-struct FoundryMarkView: View {
+struct FoundryAppIconView: View {
     let size: CGFloat
 
     var body: some View {
         Group {
-            if let image = FoundryBrand.markImage {
+            if let image = FoundryBrand.appIconImage {
                 Image(nsImage: image)
                     .resizable()
                     .interpolation(.high)
-            } else {
-                Image(systemName: "square.3.layers.3d.top.filled")
-                    .resizable()
                     .scaledToFit()
+                    .frame(width: size, height: size)
+                    .clipped()
+            } else {
+                FoundryMarkView(size: size)
             }
         }
         .frame(width: size, height: size)
+        .clipped()
         .accessibilityHidden(true)
     }
 }

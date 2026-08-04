@@ -91,7 +91,12 @@ struct PullRequestPublishRequest: Equatable {
 @MainActor
 final class WorkspaceModel: ObservableObject {
     @Published var projectURL: URL? {
-        didSet { schedulePersistence() }
+        didSet {
+            if let projectURL, !isRestoring {
+                rememberProject(projectURL)
+            }
+            schedulePersistence()
+        }
     }
     @Published var sessions: [AgentSession] = [] {
         didSet {
@@ -108,10 +113,18 @@ final class WorkspaceModel: ObservableObject {
     @Published var selectedSessionID: UUID? {
         didSet { schedulePersistence() }
     }
+    @Published var canvasBackground: CanvasBackground = .fallback {
+        didSet { schedulePersistence() }
+    }
+    @Published var activeTool: CanvasTool = .select
+    @Published var annotationColor: AnnotationColor = .chalk
+    @Published private(set) var annotations: [CanvasAnnotation] = []
+    @Published private(set) var selectedAnnotationIDs: Set<UUID> = []
     @Published var alertState: WorkspaceAlertState?
     @Published var reviewingSession: AgentSession?
     @Published var reviewQueueNotice: String?
     @Published private(set) var mergingSessionID: UUID?
+    @Published private(set) var recentProjectURLs: [URL] = []
 
     private let worktreeManager: GitWorktreeManager
     private let projectManager: GitProjectManager
@@ -122,6 +135,12 @@ final class WorkspaceModel: ObservableObject {
     private var sessionObservers: [UUID: AnyCancellable] = [:]
     private var persistenceTask: Task<Void, Never>?
     private var isRestoring = true
+    /// Snapshots of `annotations` taken before each edit, newest last.
+    private var annotationHistory: [[CanvasAnnotation]] = []
+    private static let annotationHistoryLimit = 60
+    /// Positions captured when a move begins, so every frame of the drag is
+    /// applied to the original geometry instead of compounding deltas.
+    private var selectionDragOrigin: [UUID: [CGPoint]] = [:]
 
     init(
         worktreeManager: GitWorktreeManager = GitWorktreeManager(),
@@ -182,6 +201,21 @@ final class WorkspaceModel: ObservableObject {
         if panel.runModal() == .OK, let selectedURL = panel.url {
             inspectProject(selectedURL)
         }
+    }
+
+    func openRecentProject(_ url: URL) {
+        let normalizedURL = url.standardizedFileURL
+        guard FileManager.default.fileExists(atPath: normalizedURL.path) else {
+            recentProjectURLs.removeAll {
+                $0.standardizedFileURL == normalizedURL
+            }
+            schedulePersistence()
+            alertState = .message(
+                "The recent project “\(url.lastPathComponent)” is no longer available at \(url.path)."
+            )
+            return
+        }
+        inspectProject(normalizedURL)
     }
 
     func initializeRepository(_ request: RepositoryBootstrapRequest) {
@@ -537,11 +571,221 @@ final class WorkspaceModel: ObservableObject {
     func focus(_ session: AgentSession) {
         guard !session.isArchived else { return }
         select(session)
+        centerViewport(on: session)
+        refreshGitSummary(session)
+    }
+
+    /// Brings an agent's terminal card back into view, restoring it from the
+    /// archive first when needed, and parks it in the middle of the canvas.
+    func revealTerminal(_ session: AgentSession) {
+        if session.isArchived {
+            session.isArchived = false
+        }
+        select(session)
+        centerViewport(on: session)
+    }
+
+    private func centerViewport(on session: AgentSession) {
         pan = CGSize(
             width: viewportSize.width / 2 - session.position.x * zoom,
             height: viewportSize.height / 2 - session.position.y * zoom
         )
-        refreshGitSummary(session)
+    }
+
+    // MARK: - Canvas annotations
+
+    func addAnnotation(_ annotation: CanvasAnnotation) {
+        guard !annotation.points.isEmpty else { return }
+        switch annotation.kind {
+        case .text, .freehand:
+            // Valid even as a single point: a note anchor, or a dotted tap.
+            break
+        case .rectangle, .ellipse, .line, .arrow:
+            // A click without a drag yields two near-identical corners, which
+            // would leave an invisible shape on the canvas.
+            let box = annotation.boundingBox
+            guard box.width > 2 || box.height > 2 else { return }
+        }
+        recordAnnotationHistory()
+        annotations.append(annotation)
+        schedulePersistence()
+    }
+
+    func updateAnnotationText(_ id: UUID, to text: String) {
+        guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // An empty note would be an invisible, un-erasable hit box.
+        guard !trimmed.isEmpty else {
+            annotations.remove(at: index)
+            schedulePersistence()
+            return
+        }
+        annotations[index].text = trimmed
+        schedulePersistence()
+    }
+
+    /// Removes every annotation touching `point`. Returns true if anything went.
+    @discardableResult
+    func eraseAnnotations(near point: CGPoint, tolerance: CGFloat) -> Bool {
+        let survivors = annotations.filter { !$0.hitTest(point, tolerance: tolerance) }
+        guard survivors.count != annotations.count else { return false }
+        recordAnnotationHistory()
+        annotations = survivors
+        pruneAnnotationSelection()
+        schedulePersistence()
+        return true
+    }
+
+    func undoAnnotationEdit() {
+        guard let previous = annotationHistory.popLast() else { return }
+        annotations = previous
+        pruneAnnotationSelection()
+        schedulePersistence()
+    }
+
+    /// Drops ids that no longer exist, so a stale selection can't be moved or
+    /// grouped after an undo or erase.
+    private func pruneAnnotationSelection() {
+        let living = Set(annotations.map(\.id))
+        selectedAnnotationIDs.formIntersection(living)
+    }
+
+    var canUndoAnnotationEdit: Bool { !annotationHistory.isEmpty }
+
+    func clearAnnotations() {
+        guard !annotations.isEmpty else { return }
+        recordAnnotationHistory()
+        annotations = []
+        selectedAnnotationIDs = []
+        schedulePersistence()
+    }
+
+    // MARK: - Annotation selection
+
+    /// Topmost annotation under `point`, matching the draw order.
+    func annotation(at point: CGPoint, tolerance: CGFloat) -> CanvasAnnotation? {
+        annotations.last { $0.hitTest(point, tolerance: tolerance) }
+    }
+
+    /// Grows a set of ids to include every sibling of any grouped member.
+    func expandingGroups(of ids: Set<UUID>) -> Set<UUID> {
+        let groupIDs = Set(annotations.filter { ids.contains($0.id) }.compactMap(\.groupID))
+        guard !groupIDs.isEmpty else { return ids }
+        return ids.union(
+            annotations
+                .filter { $0.groupID.map(groupIDs.contains) ?? false }
+                .map(\.id)
+        )
+    }
+
+    func selectAnnotation(_ id: UUID, additive: Bool) {
+        let target = expandingGroups(of: [id])
+        if additive {
+            // Toggling a group toggles all of it.
+            if target.isSubset(of: selectedAnnotationIDs) {
+                selectedAnnotationIDs.subtract(target)
+            } else {
+                selectedAnnotationIDs.formUnion(target)
+            }
+        } else {
+            selectedAnnotationIDs = target
+        }
+    }
+
+    func selectAnnotations(in rect: CGRect, additive: Bool) {
+        let hits = Set(
+            annotations
+                .filter { rect.intersects($0.boundingBox.insetBy(dx: -1, dy: -1)) }
+                .map(\.id)
+        )
+        let target = expandingGroups(of: hits)
+        selectedAnnotationIDs = additive ? selectedAnnotationIDs.union(target) : target
+    }
+
+    func selectAllAnnotations() {
+        selectedAnnotationIDs = Set(annotations.map(\.id))
+    }
+
+    func clearAnnotationSelection() {
+        selectedAnnotationIDs = []
+    }
+
+    func deleteSelectedAnnotations() {
+        guard !selectedAnnotationIDs.isEmpty else { return }
+        recordAnnotationHistory()
+        annotations.removeAll { selectedAnnotationIDs.contains($0.id) }
+        selectedAnnotationIDs = []
+        schedulePersistence()
+    }
+
+    var canGroupSelection: Bool {
+        // Two distinct items are needed before grouping means anything.
+        selectedAnnotationIDs.count > 1
+    }
+
+    var canUngroupSelection: Bool {
+        annotations.contains { selectedAnnotationIDs.contains($0.id) && $0.groupID != nil }
+    }
+
+    func groupSelection() {
+        guard canGroupSelection else { return }
+        recordAnnotationHistory()
+        let newGroupID = UUID()
+        for index in annotations.indices where selectedAnnotationIDs.contains(annotations[index].id) {
+            annotations[index].groupID = newGroupID
+        }
+        schedulePersistence()
+    }
+
+    func ungroupSelection() {
+        guard canUngroupSelection else { return }
+        recordAnnotationHistory()
+        for index in annotations.indices where selectedAnnotationIDs.contains(annotations[index].id) {
+            annotations[index].groupID = nil
+        }
+        schedulePersistence()
+    }
+
+    // MARK: - Moving a selection
+
+    func beginSelectionDrag() {
+        guard !selectedAnnotationIDs.isEmpty else { return }
+        recordAnnotationHistory()
+        selectionDragOrigin = Dictionary(
+            uniqueKeysWithValues: annotations
+                .filter { selectedAnnotationIDs.contains($0.id) }
+                .map { ($0.id, $0.points) }
+        )
+    }
+
+    func updateSelectionDrag(translation: CGSize) {
+        guard !selectionDragOrigin.isEmpty else { return }
+        for index in annotations.indices {
+            guard let origin = selectionDragOrigin[annotations[index].id] else { continue }
+            annotations[index].points = origin.map {
+                CGPoint(x: $0.x + translation.width, y: $0.y + translation.height)
+            }
+        }
+    }
+
+    func endSelectionDrag() {
+        guard !selectionDragOrigin.isEmpty else { return }
+        selectionDragOrigin = [:]
+        schedulePersistence()
+    }
+
+    /// Combined bounding box of the current selection, in world space.
+    var selectionBounds: CGRect? {
+        let selected = annotations.filter { selectedAnnotationIDs.contains($0.id) }
+        guard let first = selected.first else { return nil }
+        return selected.dropFirst().reduce(first.boundingBox) { $0.union($1.boundingBox) }
+    }
+
+    private func recordAnnotationHistory() {
+        annotationHistory.append(annotations)
+        if annotationHistory.count > Self.annotationHistoryLimit {
+            annotationHistory.removeFirst(annotationHistory.count - Self.annotationHistoryLimit)
+        }
     }
 
     func rename(_ session: AgentSession, to proposedName: String) {
@@ -664,6 +908,9 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func select(_ session: AgentSession?) {
+        // One selection domain at a time, so Command-Delete can't remove ink
+        // while the user is working inside a terminal card.
+        if session != nil { selectedAnnotationIDs = [] }
         guard selectedSessionID != session?.id else { return }
         selectedSessionID = session?.id
         for candidate in sessions {
@@ -741,12 +988,28 @@ final class WorkspaceModel: ObservableObject {
             return
         }
 
+        recentProjectURLs = (snapshot.recentProjectPaths ?? [])
+            .map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+
+        // Restored ahead of the project guard so the backdrop survives even when
+        // the saved project is gone.
+        canvasBackground = snapshot.canvasBackground
+            .flatMap(CanvasBackground.init(rawValue:)) ?? .fallback
+        annotations = (snapshot.annotations ?? []).compactMap(CanvasAnnotation.init(persisted:))
+
         guard let projectPath = snapshot.projectPath,
               FileManager.default.fileExists(atPath: projectPath) else {
             return
         }
 
-        projectURL = URL(fileURLWithPath: projectPath, isDirectory: true)
+        let restoredProjectURL = URL(
+            fileURLWithPath: projectPath,
+            isDirectory: true
+        ).standardizedFileURL
+        projectURL = restoredProjectURL
+        recentProjectURLs.removeAll { $0 == restoredProjectURL }
+        recentProjectURLs.insert(restoredProjectURL, at: 0)
         zoom = min(1.8, max(0.45, CGFloat(snapshot.zoom)))
         pan = CGSize(width: snapshot.panX, height: snapshot.panY)
         sessions = snapshot.sessions.compactMap(restoreSession)
@@ -880,8 +1143,32 @@ final class WorkspaceModel: ObservableObject {
                         )
                     }
                 )
+            },
+            recentProjectPaths: recentProjectURLs.map(\.path),
+            canvasBackground: canvasBackground.rawValue,
+            annotations: annotations.map { annotation in
+                PersistedAnnotation(
+                    id: annotation.id,
+                    kind: annotation.kind.rawValue,
+                    pointsX: annotation.points.map { Double($0.x) },
+                    pointsY: annotation.points.map { Double($0.y) },
+                    color: annotation.color.rawValue,
+                    lineWidth: Double(annotation.lineWidth),
+                    text: annotation.text.isEmpty ? nil : annotation.text,
+                    groupID: annotation.groupID
+                )
             }
         )
+    }
+
+    private func rememberProject(_ url: URL) {
+        let normalizedURL = url.standardizedFileURL
+        recentProjectURLs.removeAll { $0.standardizedFileURL == normalizedURL }
+        recentProjectURLs.insert(normalizedURL, at: 0)
+        if recentProjectURLs.count > 8 {
+            recentProjectURLs.removeLast(recentProjectURLs.count - 8)
+        }
+        schedulePersistence()
     }
 
     private func observeSessions() {

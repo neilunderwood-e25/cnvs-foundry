@@ -22,35 +22,37 @@ struct AgentCardView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
-            Color(red: 0.075, green: 0.08, blue: 0.10),
-            in: RoundedRectangle(cornerRadius: 15, style: .continuous)
+            Color(red: 0.045, green: 0.052, blue: 0.072),
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
         )
         .overlay {
-            RoundedRectangle(cornerRadius: 15, style: .continuous)
-                .stroke(session.isSelected ? accentColor.opacity(0.9) : .white.opacity(0.11), lineWidth: session.isSelected ? 1.5 : 1)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(
+                    session.isSelected ? accentColor.opacity(0.88) : .white.opacity(0.075),
+                    lineWidth: session.isSelected ? 1.25 : 0.75
+                )
         }
         .overlay(alignment: .bottomTrailing) {
             resizeHandle
         }
-        .shadow(color: .black.opacity(0.22), radius: 12, y: 7)
+        .shadow(color: .black.opacity(0.18), radius: 7, y: 4)
     }
 
     private var header: some View {
         HStack(spacing: 10) {
             ZStack {
-                Circle().fill(accentColor.opacity(0.17))
-                Image(systemName: session.provider.symbolName)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(accentColor)
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(accentColor.opacity(0.13))
+                ProviderLogo(provider: session.provider, size: 13)
             }
-            .frame(width: 28, height: 28)
+            .frame(width: 23, height: 23)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(session.name)
-                    .font(.foundry(size: 12, weight: .semibold))
+                    .font(.foundry(size: 11, weight: .semibold))
                     .lineLimit(1)
                 Text(agentSubtitle)
-                    .font(.foundry(size: 10))
+                    .font(.foundry(size: 9))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -109,14 +111,14 @@ struct AgentCardView: View {
                     .disabled(session.worktree == nil)
             } label: {
                 Image(systemName: "ellipsis")
-                    .frame(width: 22, height: 22)
+                    .frame(width: 18, height: 18)
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
         }
-        .padding(.horizontal, 12)
-        .frame(height: 48)
+        .padding(.horizontal, 10)
+        .frame(height: 38)
         .contentShape(Rectangle())
     }
 
@@ -207,7 +209,7 @@ struct AgentCardView: View {
         .foregroundStyle(.secondary)
         .padding(.horizontal, 12)
         .padding(.trailing, 14)
-        .frame(height: 30)
+        .frame(height: 27)
     }
 
     private func pullRequestBadgeColor(_ state: PullRequestQueueState) -> Color {
@@ -228,9 +230,6 @@ struct AgentCardView: View {
         }
         .font(.foundry(size: 9, weight: .semibold))
         .foregroundStyle(statusColor)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(statusColor.opacity(0.11), in: Capsule())
         .help(statusHelp)
     }
 

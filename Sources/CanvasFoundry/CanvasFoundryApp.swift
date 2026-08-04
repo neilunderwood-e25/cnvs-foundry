@@ -16,7 +16,7 @@ struct CanvasFoundryApp: App {
                 .preferredColorScheme(.dark)
                 .frame(minWidth: 980, minHeight: 680)
         }
-        .windowStyle(.hiddenTitleBar)
+        .windowToolbarStyle(.unifiedCompact(showsTitle: false))
         .defaultSize(width: 1440, height: 900)
     }
 }

@@ -35,6 +35,36 @@ enum ProjectIDE: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Name of the launcher bundled at `Contents/Resources/app/bin`.
+    var commandLineToolName: String {
+        switch self {
+        case .cursor: "cursor"
+        case .visualStudioCode: "code"
+        }
+    }
+
+    /// Arguments that force a full editor window onto `path`.
+    ///
+    /// Cursor's launcher routes on its first argument: `agent` goes to
+    /// cursor-agent and `editor` goes to the IDE. Naming `editor` explicitly
+    /// keeps a project from landing in the standalone agent window.
+    func editorLaunchArguments(forPath path: String) -> [String] {
+        switch self {
+        case .cursor: ["editor", "--new-window", path]
+        case .visualStudioCode: ["--new-window", path]
+        }
+    }
+
+    @MainActor
+    func commandLineToolURL(workspace: NSWorkspace = .shared) -> URL? {
+        guard let applicationURL = applicationURL(workspace: workspace) else { return nil }
+        let toolURL = applicationURL
+            .appendingPathComponent("Contents/Resources/app/bin", isDirectory: true)
+            .appendingPathComponent(commandLineToolName, isDirectory: false)
+        guard FileManager.default.isExecutableFile(atPath: toolURL.path) else { return nil }
+        return toolURL
+    }
+
     @MainActor
     func applicationURL(workspace: NSWorkspace = .shared) -> URL? {
         if let registeredURL = workspace.urlForApplication(
@@ -76,6 +106,17 @@ enum IDEProjectOpener {
             throw IDEProjectOpeningError.applicationNotInstalled(ide.buttonTitle)
         }
 
+        // Preferred path: the bundled launcher, which can be told to open an
+        // editor window rather than letting the app decide what to restore.
+        if let toolURL = ide.commandLineToolURL(workspace: workspace) {
+            try await launch(
+                toolURL: toolURL,
+                arguments: ide.editorLaunchArguments(forPath: projectURL.path),
+                ide: ide
+            )
+            return
+        }
+
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         try await withCheckedThrowingContinuation {
@@ -90,6 +131,45 @@ enum IDEProjectOpener {
                 } else {
                     continuation.resume(returning: ())
                 }
+            }
+        }
+    }
+
+    private static func launch(
+        toolURL: URL,
+        arguments: [String],
+        ide: ProjectIDE
+    ) async throws {
+        let process = Process()
+        process.executableURL = toolURL
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            process.terminationHandler = { finishedProcess in
+                guard finishedProcess.terminationStatus != 0 else {
+                    continuation.resume(returning: ())
+                    return
+                }
+                let details = String(
+                    data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+                    encoding: .utf8
+                )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                continuation.resume(
+                    throwing: IDEProjectOpeningError.launchFailed(
+                        ide.shortDisplayName,
+                        details
+                    )
+                )
+            }
+            do {
+                try process.run()
+            } catch {
+                process.terminationHandler = nil
+                continuation.resume(throwing: error)
             }
         }
     }
@@ -145,11 +225,16 @@ private struct IDEWorkspaceFolderDocument: Codable {
 
 enum IDEProjectOpeningError: LocalizedError {
     case applicationNotInstalled(String)
+    case launchFailed(String, String)
 
     var errorDescription: String? {
         switch self {
         case .applicationNotInstalled(let applicationName):
             "\(applicationName) is not installed on this Mac."
+        case .launchFailed(let ideName, let details):
+            details.isEmpty
+                ? "\(ideName) could not open the project."
+                : "\(ideName) could not open the project: \(details)"
         }
     }
 }

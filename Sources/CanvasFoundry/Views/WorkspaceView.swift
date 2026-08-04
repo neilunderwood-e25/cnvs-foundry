@@ -5,26 +5,42 @@ struct WorkspaceView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = WorkspaceModel()
     @State private var isReviewQueuePresented = false
+    @AppStorage("foundry.agentSidebarVisible") private var isSidebarVisible = true
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            HStack(spacing: 0) {
-                if model.projectURL != nil {
+        HStack(spacing: 0) {
+            if model.projectURL != nil && isSidebarVisible {
+                HStack(spacing: 0) {
                     AgentFleetSidebar(model: model)
-                    Divider().opacity(0.55)
+                        .frame(width: 248)
+                    Divider()
+                        .opacity(0.45)
                 }
-                InfiniteCanvasView(model: model)
-                    .overlay {
-                        if model.projectURL == nil {
-                            EmptyWorkspaceView {
-                                model.chooseProject()
-                            }
+                .frame(width: 249)
+                .transition(.move(edge: .leading).combined(with: .opacity))
+            }
+
+            InfiniteCanvasView(model: model)
+                .overlay {
+                    if model.projectURL == nil {
+                        EmptyWorkspaceView {
+                            model.chooseProject()
                         }
                     }
-            }
+                }
+                // Layered last so the control floats above both the canvas and
+                // the empty state.
+                .overlay(alignment: .top) {
+                    CanvasProjectBar(model: model)
+                        .padding(.top, 14)
+                }
+                .ignoresSafeArea(.container, edges: .bottom)
         }
-        .background(Color(red: 0.035, green: 0.04, blue: 0.055))
+        .animation(.easeInOut(duration: 0.2), value: isSidebarVisible)
+        .toolbar {
+            workspaceToolbar
+        }
+        .background(model.canvasBackground.chromeColor)
         .onDisappear {
             model.persistWorkspace()
         }
@@ -134,131 +150,97 @@ struct WorkspaceView: View {
         return lines.joined(separator: "\n\n")
     }
 
-    private var header: some View {
-        HStack(spacing: 14) {
-            HStack(spacing: 9) {
-                FoundryMarkView(size: 20)
-                Text("CANVAS FOUNDRY")
-                    .font(.foundry(size: 13, weight: .bold))
-                    .tracking(1.4)
-            }
-
-            Divider().frame(height: 22)
-
-            Button {
-                model.chooseProject()
-            } label: {
-                HStack(spacing: 7) {
-                    Image(systemName: "folder")
-                    Text(model.projectURL?.lastPathComponent ?? "Choose project")
-                        .lineLimit(1)
+    @ToolbarContentBuilder
+    private var workspaceToolbar: some ToolbarContent {
+        if model.projectURL != nil {
+            ToolbarItem(placement: .navigation) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isSidebarVisible.toggle()
+                    }
+                } label: {
+                    Label(
+                        isSidebarVisible ? "Hide Agent Sidebar" : "Show Agent Sidebar",
+                        systemImage: "sidebar.left"
+                    )
                 }
+                .keyboardShortcut("s", modifiers: [.control, .command])
+                .help(isSidebarVisible ? "Hide agent sidebar" : "Show agent sidebar")
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+        }
 
-            if model.projectURL != nil {
-                IDELaunchButtons(model: model)
+        if model.projectURL != nil {
+            ToolbarItemGroup(placement: .primaryAction) {
                 Button {
                     isReviewQueuePresented = true
                 } label: {
                     Label(
                         model.openPullRequestCount == 0
                             ? "Review Queue"
-                            : "Review Queue (\(model.openPullRequestCount))",
+                            : "Review Queue, \(model.openPullRequestCount) open",
                         systemImage: "arrow.triangle.pull"
                     )
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
+                .help("Open review queue")
 
-            Spacer()
+                IDELaunchToolbarMenu(model: model)
 
-            if !model.sessions.isEmpty {
-                Label("\(model.activeAgentCount) working", systemImage: "circle.hexagongrid.fill")
-                    .font(.foundry(size: 11, weight: .medium))
-                    .foregroundStyle(model.activeAgentCount > 0 ? .green : .secondary)
-            }
-
-            HStack(spacing: 4) {
-                Button(action: model.zoomOut) { Image(systemName: "minus") }
-                Text("\(Int(model.zoom * 100))%")
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .frame(width: 45)
-                Button(action: model.zoomIn) { Image(systemName: "plus") }
-                Button(action: model.resetView) { Image(systemName: "scope") }
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-
-            if model.projectURL != nil {
                 Menu {
                     ForEach(AgentProvider.allCases) { provider in
                         Button {
                             model.openTerminal(provider: provider)
                         } label: {
-                            Label("Open \(provider.launchName)", systemImage: provider.symbolName)
+                            Label {
+                                Text("Open \(provider.launchName)")
+                            } icon: {
+                                provider.menuIcon
+                            }
                         }
                     }
                 } label: {
                     Label("New Agent", systemImage: "plus")
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
+                .help("Open a new CLI agent")
             }
-        }
-        .padding(.horizontal, 18)
-        .frame(height: 54)
-        .background(.ultraThinMaterial)
-        .overlay(alignment: .bottom) {
-            Divider().opacity(0.55)
         }
     }
 }
 
-private struct IDELaunchButtons: View {
+private struct IDELaunchToolbarMenu: View {
     @ObservedObject var model: WorkspaceModel
 
     var body: some View {
-        ForEach(installedIDEs, id: \.ide.id) { application in
-            Menu {
-                Button {
-                    model.openProject(in: application.ide)
-                } label: {
-                    Label("Open Main Project", systemImage: "folder")
-                }
-                if !model.availableIDEWorktreeSessions.isEmpty {
+        Menu {
+            if installedIDEs.isEmpty {
+                Text("No supported IDE is installed")
+            }
+            ForEach(installedIDEs) { ide in
+                Section(ide.buttonTitle) {
                     Button {
-                        model.openAllActiveWorktrees(in: application.ide)
+                        model.openProject(in: ide)
                     } label: {
-                        Label(
-                            "Open Main + \(model.availableIDEWorktreeSessions.count) Agent Worktree\(model.availableIDEWorktreeSessions.count == 1 ? "" : "s")",
-                            systemImage: "square.3.layers.3d"
-                        )
+                        Label("Open Main Project", systemImage: "folder")
+                    }
+                    if !model.availableIDEWorktreeSessions.isEmpty {
+                        Button {
+                            model.openAllActiveWorktrees(in: ide)
+                        } label: {
+                            Label(
+                                "Open Main + \(model.availableIDEWorktreeSessions.count) Agent Worktree\(model.availableIDEWorktreeSessions.count == 1 ? "" : "s")",
+                                systemImage: "square.3.layers.3d"
+                            )
+                        }
                     }
                 }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(nsImage: application.icon)
-                        .resizable()
-                        .frame(width: 16, height: 16)
-                    Text(application.ide.buttonTitle)
-                        .lineLimit(1)
-                }
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("Choose which worktrees to open in \(application.ide.buttonTitle)")
+        } label: {
+            Label("Open in IDE", systemImage: "chevron.left.forwardslash.chevron.right")
         }
+        .help("Open project or worktrees in an IDE")
     }
 
-    private var installedIDEs: [(ide: ProjectIDE, icon: NSImage)] {
-        ProjectIDE.allCases.compactMap { ide in
-            guard let applicationURL = ide.applicationURL() else { return nil }
-            let icon = NSWorkspace.shared.icon(forFile: applicationURL.path)
-            return (ide, icon)
-        }
+    private var installedIDEs: [ProjectIDE] {
+        ProjectIDE.allCases.filter { $0.applicationURL() != nil }
     }
 }
 

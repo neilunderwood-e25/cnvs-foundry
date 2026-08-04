@@ -10,6 +10,11 @@ struct WorkspaceSnapshot: Codable, Equatable {
     let panY: Double
     let selectedSessionID: UUID?
     let sessions: [PersistedAgentSession]
+    let recentProjectPaths: [String]?
+    /// Absent in snapshots written before backdrops were selectable.
+    let canvasBackground: String?
+    /// Absent in snapshots written before the canvas was drawable.
+    let annotations: [PersistedAnnotation]?
 
     init(
         version: Int = currentVersion,
@@ -18,7 +23,10 @@ struct WorkspaceSnapshot: Codable, Equatable {
         panX: Double,
         panY: Double,
         selectedSessionID: UUID?,
-        sessions: [PersistedAgentSession]
+        sessions: [PersistedAgentSession],
+        recentProjectPaths: [String]? = nil,
+        canvasBackground: String? = nil,
+        annotations: [PersistedAnnotation]? = nil
     ) {
         self.version = version
         self.projectPath = projectPath
@@ -27,7 +35,23 @@ struct WorkspaceSnapshot: Codable, Equatable {
         self.panY = panY
         self.selectedSessionID = selectedSessionID
         self.sessions = sessions
+        self.recentProjectPaths = recentProjectPaths
+        self.canvasBackground = canvasBackground
+        self.annotations = annotations
     }
+}
+
+struct PersistedAnnotation: Codable, Equatable {
+    let id: UUID
+    let kind: String
+    /// Parallel coordinate arrays, kept flat so the JSON stays readable.
+    let pointsX: [Double]
+    let pointsY: [Double]
+    let color: String
+    let lineWidth: Double
+    let text: String?
+    /// Absent for ungrouped items and for snapshots predating grouping.
+    let groupID: UUID?
 }
 
 struct PersistedAgentSession: Codable, Equatable {

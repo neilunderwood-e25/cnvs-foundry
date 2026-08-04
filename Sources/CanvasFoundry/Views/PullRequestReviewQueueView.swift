@@ -121,9 +121,12 @@ private struct PullRequestQueueRow: View {
         if let pullRequest = session.pullRequest {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .top, spacing: 12) {
-                    Image(systemName: session.provider.symbolName)
+                    ProviderLogo(provider: session.provider, size: 16)
                         .frame(width: 30, height: 30)
-                        .background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
+                        .background(
+                            session.provider.brandColor.opacity(0.14),
+                            in: RoundedRectangle(cornerRadius: 7)
+                        )
 
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 7) {

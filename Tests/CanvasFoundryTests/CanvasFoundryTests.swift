@@ -95,6 +95,387 @@ final class CanvasFoundryTests: XCTestCase {
         ])
     }
 
+    func testCanvasBackgroundSurvivesAPersistenceRoundTripAndOldSnapshots() throws {
+        let snapshot = WorkspaceSnapshot(
+            projectPath: "/tmp/Main Project",
+            zoom: 1,
+            panX: 12,
+            panY: 34,
+            selectedSessionID: nil,
+            sessions: [],
+            canvasBackground: CanvasBackground.plum.rawValue
+        )
+        let encoded = try JSONEncoder().encode(snapshot)
+        let decoded = try JSONDecoder().decode(WorkspaceSnapshot.self, from: encoded)
+        XCTAssertEqual(decoded.canvasBackground, "plum")
+        XCTAssertEqual(
+            decoded.canvasBackground.flatMap(CanvasBackground.init(rawValue:)),
+            .plum
+        )
+
+        // Snapshots written before backdrops existed carry no key at all, and
+        // must decode rather than throw.
+        let legacy = Data(
+            """
+            {"version":1,"zoom":1,"panX":0,"panY":0,"sessions":[]}
+            """.utf8
+        )
+        let legacySnapshot = try JSONDecoder().decode(WorkspaceSnapshot.self, from: legacy)
+        XCTAssertNil(legacySnapshot.canvasBackground)
+        XCTAssertEqual(
+            legacySnapshot.canvasBackground
+                .flatMap(CanvasBackground.init(rawValue:)) ?? .fallback,
+            .midnight
+        )
+
+        // An unknown value (older app, newer file) also lands on the default.
+        XCTAssertEqual(CanvasBackground(rawValue: "aurora") ?? .fallback, .midnight)
+    }
+
+    func testAnnotationHitTestingMatchesStrokesNotHollowInteriors() {
+        let stroke = CanvasAnnotation(
+            kind: .freehand,
+            points: [CGPoint(x: 0, y: 0), CGPoint(x: 100, y: 0)],
+            color: .chalk
+        )
+        XCTAssertTrue(stroke.hitTest(CGPoint(x: 50, y: 4), tolerance: 8))
+        XCTAssertFalse(stroke.hitTest(CGPoint(x: 50, y: 40), tolerance: 8))
+
+        let box = CanvasAnnotation(
+            kind: .rectangle,
+            points: [CGPoint(x: 0, y: 0), CGPoint(x: 200, y: 120)],
+            color: .amber
+        )
+        XCTAssertTrue(box.hitTest(CGPoint(x: 0, y: 60), tolerance: 8), "edge should hit")
+        XCTAssertFalse(
+            box.hitTest(CGPoint(x: 100, y: 60), tolerance: 8),
+            "hollow middle should not hit"
+        )
+
+        let ring = CanvasAnnotation(
+            kind: .ellipse,
+            points: [CGPoint(x: 0, y: 0), CGPoint(x: 100, y: 100)],
+            color: .mint
+        )
+        XCTAssertTrue(ring.hitTest(CGPoint(x: 50, y: 0), tolerance: 8))
+        XCTAssertFalse(ring.hitTest(CGPoint(x: 50, y: 50), tolerance: 8))
+
+        let note = CanvasAnnotation(
+            kind: .text,
+            points: [CGPoint(x: 10, y: 10)],
+            color: .sky,
+            text: "Ship the review queue"
+        )
+        XCTAssertTrue(note.hitTest(CGPoint(x: 14, y: 16), tolerance: 4))
+        XCTAssertFalse(note.hitTest(CGPoint(x: 400, y: 300), tolerance: 4))
+    }
+
+    @MainActor
+    func testAnnotationEditingErasingAndUndo() {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Canvas Foundry Ink-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        try? FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+
+        let model = WorkspaceModel(
+            persistence: WorkspacePersistence(
+                fileURL: scratch.appendingPathComponent("workspace.json")
+            )
+        )
+        XCTAssertFalse(model.canUndoAnnotationEdit)
+
+        let stroke = CanvasAnnotation(
+            kind: .line,
+            points: [CGPoint(x: 0, y: 0), CGPoint(x: 90, y: 0)],
+            color: .chalk
+        )
+        model.addAnnotation(stroke)
+        XCTAssertEqual(model.annotations.count, 1)
+
+        // A shape dragged nowhere is a stray click and must not be kept.
+        model.addAnnotation(
+            CanvasAnnotation(
+                kind: .rectangle,
+                points: [CGPoint(x: 5, y: 5), CGPoint(x: 5.5, y: 5.5)],
+                color: .chalk
+            )
+        )
+        XCTAssertEqual(model.annotations.count, 1, "degenerate shape should be dropped")
+
+        let note = CanvasAnnotation(kind: .text, points: [.zero], color: .rose)
+        model.addAnnotation(note)
+        model.updateAnnotationText(note.id, to: "   ")
+        XCTAssertEqual(
+            model.annotations.count,
+            1,
+            "a blank note leaves an invisible hit box, so it should be removed"
+        )
+
+        XCTAssertFalse(model.eraseAnnotations(near: CGPoint(x: 45, y: 90), tolerance: 6))
+        XCTAssertTrue(model.eraseAnnotations(near: CGPoint(x: 45, y: 2), tolerance: 6))
+        XCTAssertTrue(model.annotations.isEmpty)
+
+        model.undoAnnotationEdit()
+        XCTAssertEqual(model.annotations.map(\.id), [stroke.id], "undo should restore the stroke")
+    }
+
+    func testTextNoteBoxIsMeasuredAndGrowsWithLines() {
+        FoundryBrand.registerBundledFonts()
+
+        let short = CanvasAnnotation(kind: .text, points: [.zero], color: .chalk, text: "hi")
+        let long = CanvasAnnotation(
+            kind: .text,
+            points: [.zero],
+            color: .chalk,
+            text: "a considerably longer thought about the review queue"
+        )
+        XCTAssertGreaterThan(
+            long.boundingBox.width,
+            short.boundingBox.width,
+            "the hit box must follow the laid-out run, not a fixed width"
+        )
+        XCTAssertEqual(
+            short.boundingBox.height,
+            long.boundingBox.height,
+            accuracy: 1,
+            "single lines should be the same height regardless of length"
+        )
+
+        // Multi-line notes must grow downwards, or the lower lines would sit
+        // outside the box and be unselectable.
+        let twoLines = CanvasAnnotation(
+            kind: .text,
+            points: [.zero],
+            color: .chalk,
+            text: "first line\nsecond line"
+        )
+        XCTAssertGreaterThan(twoLines.boundingBox.height, short.boundingBox.height * 1.5)
+        XCTAssertTrue(
+            twoLines.hitTest(
+                CGPoint(x: 4, y: twoLines.boundingBox.height - 2),
+                tolerance: 1
+            ),
+            "the second line should be inside the hit box"
+        )
+
+        // An empty note still needs a clickable box while it is being typed.
+        let empty = CanvasAnnotation(kind: .text, points: [.zero], color: .chalk)
+        XCTAssertGreaterThan(empty.boundingBox.width, 0)
+        XCTAssertGreaterThan(empty.boundingBox.height, 0)
+    }
+
+    @MainActor
+    func testGroupedAnnotationsSelectAndMoveTogether() {
+        let model = inkModel()
+
+        let left = CanvasAnnotation(
+            kind: .rectangle,
+            points: [CGPoint(x: 0, y: 0), CGPoint(x: 60, y: 40)],
+            color: .sky
+        )
+        let right = CanvasAnnotation(
+            kind: .ellipse,
+            points: [CGPoint(x: 200, y: 0), CGPoint(x: 260, y: 40)],
+            color: .mint
+        )
+        let loner = CanvasAnnotation(
+            kind: .line,
+            points: [CGPoint(x: 0, y: 400), CGPoint(x: 80, y: 400)],
+            color: .rose
+        )
+        [left, right, loner].forEach(model.addAnnotation)
+
+        // Marquee across the two shapes, but not the far-away line.
+        model.selectAnnotations(
+            in: CGRect(x: -20, y: -20, width: 400, height: 120),
+            additive: false
+        )
+        XCTAssertEqual(model.selectedAnnotationIDs, [left.id, right.id])
+        XCTAssertTrue(model.canGroupSelection)
+        XCTAssertFalse(model.canUngroupSelection)
+
+        model.groupSelection()
+        XCTAssertTrue(model.canUngroupSelection)
+        let groupID = try? XCTUnwrap(
+            model.annotations.first { $0.id == left.id }?.groupID
+        )
+        XCTAssertNotNil(groupID)
+        XCTAssertEqual(model.annotations.first { $0.id == right.id }?.groupID, groupID)
+        XCTAssertNil(model.annotations.first { $0.id == loner.id }?.groupID)
+
+        // Clicking one member must pull in the whole group.
+        model.clearAnnotationSelection()
+        model.selectAnnotation(left.id, additive: false)
+        XCTAssertEqual(model.selectedAnnotationIDs, [left.id, right.id])
+
+        // Moving the selection moves every member by the same offset.
+        model.beginSelectionDrag()
+        model.updateSelectionDrag(translation: CGSize(width: 25, height: -10))
+        model.updateSelectionDrag(translation: CGSize(width: 50, height: -20))
+        model.endSelectionDrag()
+
+        XCTAssertEqual(
+            model.annotations.first { $0.id == left.id }?.points,
+            [CGPoint(x: 50, y: -20), CGPoint(x: 110, y: 20)],
+            "repeated drag frames must apply to the original geometry, not compound"
+        )
+        XCTAssertEqual(
+            model.annotations.first { $0.id == right.id }?.points,
+            [CGPoint(x: 250, y: -20), CGPoint(x: 310, y: 20)]
+        )
+        XCTAssertEqual(
+            model.annotations.first { $0.id == loner.id }?.points,
+            loner.points,
+            "unselected items must not move"
+        )
+
+        // One history entry for the whole drag.
+        model.undoAnnotationEdit()
+        XCTAssertEqual(model.annotations.first { $0.id == left.id }?.points, left.points)
+
+        model.selectAnnotation(left.id, additive: false)
+        model.ungroupSelection()
+        XCTAssertNil(model.annotations.first { $0.id == left.id }?.groupID)
+        model.clearAnnotationSelection()
+        model.selectAnnotation(left.id, additive: false)
+        XCTAssertEqual(
+            model.selectedAnnotationIDs,
+            [left.id],
+            "after ungrouping, a click should take only the clicked item"
+        )
+    }
+
+    @MainActor
+    func testSelectionShortcutsAndStaleSelectionHandling() {
+        let model = inkModel()
+        let first = CanvasAnnotation(
+            kind: .line,
+            points: [CGPoint(x: 0, y: 0), CGPoint(x: 90, y: 0)],
+            color: .chalk
+        )
+        let second = CanvasAnnotation(
+            kind: .line,
+            points: [CGPoint(x: 0, y: 60), CGPoint(x: 90, y: 60)],
+            color: .amber
+        )
+        [first, second].forEach(model.addAnnotation)
+
+        // Shift-click toggles rather than replaces.
+        model.selectAnnotation(first.id, additive: false)
+        model.selectAnnotation(second.id, additive: true)
+        XCTAssertEqual(model.selectedAnnotationIDs, [first.id, second.id])
+        model.selectAnnotation(second.id, additive: true)
+        XCTAssertEqual(model.selectedAnnotationIDs, [first.id])
+
+        model.selectAllAnnotations()
+        XCTAssertEqual(model.selectedAnnotationIDs.count, 2)
+        model.deleteSelectedAnnotations()
+        XCTAssertTrue(model.annotations.isEmpty)
+        XCTAssertTrue(model.selectedAnnotationIDs.isEmpty)
+
+        // Undo brings items back; the selection must not resurrect stale ids.
+        model.undoAnnotationEdit()
+        XCTAssertEqual(model.annotations.count, 2)
+        XCTAssertTrue(model.selectedAnnotationIDs.isEmpty)
+
+        // Erasing a selected item drops it from the selection too, so a later
+        // group or move cannot act on something that no longer exists.
+        model.selectAllAnnotations()
+        XCTAssertTrue(model.eraseAnnotations(near: CGPoint(x: 45, y: 0), tolerance: 6))
+        XCTAssertEqual(model.selectedAnnotationIDs, [second.id])
+        XCTAssertFalse(model.canGroupSelection)
+    }
+
+    @MainActor
+    private func inkModel() -> WorkspaceModel {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Canvas Foundry Ink-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: scratch) }
+        return WorkspaceModel(
+            persistence: WorkspacePersistence(
+                fileURL: scratch.appendingPathComponent("workspace.json")
+            )
+        )
+    }
+
+    func testAnnotationsSurviveAPersistenceRoundTrip() throws {
+        let stroke = CanvasAnnotation(
+            kind: .arrow,
+            points: [CGPoint(x: 1, y: 2), CGPoint(x: 30, y: 40)],
+            color: .sky,
+            lineWidth: 3,
+            text: ""
+        )
+        let snapshot = WorkspaceSnapshot(
+            projectPath: nil,
+            zoom: 1,
+            panX: 0,
+            panY: 0,
+            selectedSessionID: nil,
+            sessions: [],
+            annotations: [
+                PersistedAnnotation(
+                    id: stroke.id,
+                    kind: stroke.kind.rawValue,
+                    pointsX: stroke.points.map { Double($0.x) },
+                    pointsY: stroke.points.map { Double($0.y) },
+                    color: stroke.color.rawValue,
+                    lineWidth: Double(stroke.lineWidth),
+                    text: nil,
+                    groupID: nil
+                )
+            ]
+        )
+
+        let decoded = try JSONDecoder().decode(
+            WorkspaceSnapshot.self,
+            from: try JSONEncoder().encode(snapshot)
+        )
+        let restored = try XCTUnwrap(
+            (decoded.annotations ?? []).compactMap(CanvasAnnotation.init(persisted:)).first
+        )
+        XCTAssertEqual(restored, stroke)
+
+        // Mismatched coordinate arrays would crash a naive zip-and-index restore.
+        let corrupt = PersistedAnnotation(
+            id: UUID(),
+            kind: "freehand",
+            pointsX: [1, 2, 3],
+            pointsY: [1],
+            color: "chalk",
+            lineWidth: 2,
+            text: nil,
+            groupID: nil
+        )
+        XCTAssertNil(CanvasAnnotation(persisted: corrupt))
+
+        let unknownKind = PersistedAnnotation(
+            id: UUID(),
+            kind: "hexagon",
+            pointsX: [1],
+            pointsY: [1],
+            color: "chalk",
+            lineWidth: 2,
+            text: nil,
+            groupID: nil
+        )
+        XCTAssertNil(CanvasAnnotation(persisted: unknownKind))
+    }
+
+    func testIDELaunchArgumentsForceAnEditorWindowRatherThanAnAgentWindow() {
+        XCTAssertEqual(
+            ProjectIDE.cursor.editorLaunchArguments(forPath: "/tmp/Main Project"),
+            ["editor", "--new-window", "/tmp/Main Project"]
+        )
+        XCTAssertEqual(
+            ProjectIDE.visualStudioCode.editorLaunchArguments(forPath: "/tmp/Main Project"),
+            ["--new-window", "/tmp/Main Project"]
+        )
+        XCTAssertEqual(ProjectIDE.cursor.commandLineToolName, "cursor")
+        XCTAssertEqual(ProjectIDE.visualStudioCode.commandLineToolName, "code")
+    }
+
     func testCanvasPlacementAvoidsExistingTerminalFrames() {
         let itemSize = CGSize(width: 520, height: 360)
         let firstCenter = CanvasPlacementEngine.nextCenter(
@@ -210,6 +591,7 @@ final class CanvasFoundryTests: XCTestCase {
         let model = WorkspaceModel(persistence: persistence)
 
         XCTAssertEqual(model.projectURL?.standardizedFileURL, project.standardizedFileURL)
+        XCTAssertEqual(model.recentProjectURLs.first?.standardizedFileURL, project.standardizedFileURL)
         XCTAssertEqual(model.zoom, 1.25)
         XCTAssertEqual(model.pan, CGSize(width: 240, height: 160))
         XCTAssertEqual(model.selectedSessionID, sessionID)

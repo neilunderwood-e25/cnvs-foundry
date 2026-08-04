@@ -65,8 +65,7 @@ struct AgentGitReviewView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            Image(systemName: session.provider.symbolName)
-                .foregroundStyle(session.provider == .claude ? .orange : .green)
+            ProviderLogo(provider: session.provider, size: 16)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Review \(session.name)")
                     .font(.foundry(size: 13, weight: .semibold))

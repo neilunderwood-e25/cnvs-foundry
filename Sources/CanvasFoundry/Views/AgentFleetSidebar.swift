@@ -6,14 +6,16 @@ struct AgentFleetSidebar: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("AGENTS")
-                    .font(.foundry(size: 11, weight: .bold))
-                    .tracking(1.1)
+                Text("Agents")
+                    .font(.foundry(size: 13, weight: .semibold))
                 Spacer()
                 Text("\(model.visibleSessions.count)")
                     .font(.foundry(size: 10, weight: .medium).monospacedDigit())
                     .foregroundStyle(.secondary)
-                Button(action: model.refreshAllGitSummaries) {
+                Button {
+                    model.refreshAllGitSummaries()
+                    model.refreshAllPullRequests()
+                } label: {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.plain)
@@ -21,18 +23,28 @@ struct AgentFleetSidebar: View {
                 .help("Refresh Git status")
             }
             .padding(.horizontal, 14)
-            .frame(height: 42)
+            .frame(height: 38)
 
             Divider().opacity(0.45)
 
             if model.sessions.isEmpty {
-                ContentUnavailableView(
-                    "No agents yet",
-                    systemImage: "terminal",
-                    description: Text("Open Claude Code or Codex to begin.")
-                )
+                VStack(spacing: 8) {
+                    Image(systemName: "terminal")
+                        .font(.system(size: 20, weight: .light))
+                        .foregroundStyle(.tertiary)
+                    Text("No agents yet")
+                        .font(.foundry(size: 12, weight: .medium))
+                    Text("Open Claude Code or Codex to begin.")
+                        .font(.foundry(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(20)
             } else {
                 List {
+                    fleetSection("NEEDS YOU", sessions: needsYouSessions)
+                    fleetSection("REVIEW", sessions: reviewSessions)
                     fleetSection("WORKING", sessions: workingSessions)
                     fleetSection("STOPPED", sessions: stoppedSessions)
                     fleetSection("COMPLETED", sessions: completedSessions)
@@ -43,8 +55,8 @@ struct AgentFleetSidebar: View {
                 .scrollContentBackground(.hidden)
             }
         }
-        .frame(width: 238)
-        .background(Color.black.opacity(0.14))
+        .frame(minWidth: 210)
+        .background(.ultraThinMaterial)
     }
 
     @ViewBuilder
@@ -60,6 +72,7 @@ struct AgentFleetSidebar: View {
                         session: session,
                         isArchived: archived,
                         onFocus: { model.focus(session) },
+                        onFindInTerminal: { model.revealTerminal(session) },
                         onRename: { model.rename(session, to: $0) },
                         onArchive: { model.archive(session) },
                         onRestore: { model.restore(session) },
@@ -70,6 +83,8 @@ struct AgentFleetSidebar: View {
                         onPushPullRequestUpdates: { model.pushPullRequestUpdates(session) },
                         onDelete: { model.prepareWorktreeDeletion(session) }
                     )
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
                 }
             } header: {
                 Text(title)
@@ -80,20 +95,32 @@ struct AgentFleetSidebar: View {
     }
 
     private var workingSessions: [AgentSession] {
-        activeSessions.filter { $0.status.isActive || isNeedsYou($0.status) }
+        activeSessions.filter {
+            $0.status.isActive && !isNeedsYou($0.status) && $0.pullRequest?.state != .open
+        }
+    }
+
+    private var needsYouSessions: [AgentSession] {
+        activeSessions.filter { isNeedsYou($0.status) }
+    }
+
+    private var reviewSessions: [AgentSession] {
+        activeSessions.filter {
+            !isNeedsYou($0.status) && $0.pullRequest?.state == .open
+        }
     }
 
     private var stoppedSessions: [AgentSession] {
-        activeSessions.filter { $0.status == .stopped }
+        activeSessions.filter { $0.status == .stopped && $0.pullRequest?.state != .open }
     }
 
     private var completedSessions: [AgentSession] {
-        activeSessions.filter { $0.status == .completed }
+        activeSessions.filter { $0.status == .completed && $0.pullRequest?.state != .open }
     }
 
     private var failedSessions: [AgentSession] {
         activeSessions.filter {
-            if case .failed = $0.status { return true }
+            if case .failed = $0.status { return $0.pullRequest?.state != .open }
             return false
         }
     }
@@ -116,6 +143,7 @@ private struct FleetAgentRow: View {
     @ObservedObject var session: AgentSession
     let isArchived: Bool
     let onFocus: () -> Void
+    let onFindInTerminal: () -> Void
     let onRename: (String) -> Void
     let onArchive: () -> Void
     let onRestore: () -> Void
@@ -127,14 +155,13 @@ private struct FleetAgentRow: View {
     let onDelete: () -> Void
 
     @State private var isRenaming = false
+    @State private var isMenuHovered = false
     @State private var draftName = ""
     @FocusState private var isNameFocused: Bool
 
     var body: some View {
         HStack(spacing: 9) {
-            Image(systemName: session.provider.symbolName)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(providerColor)
+            ProviderLogo(provider: session.provider, size: 14)
                 .frame(width: 18)
 
             VStack(alignment: .leading, spacing: 3) {
@@ -185,13 +212,36 @@ private struct FleetAgentRow: View {
                 lifecycleMenu
             } label: {
                 Image(systemName: "ellipsis")
-                    .frame(width: 20, height: 20)
+                    .font(.system(size: 13, weight: .bold))
+                    // Explicit white: hierarchical styles like .secondary get
+                    // dimmed again over the sidebar material and when the window
+                    // is inactive, which washed the dots out.
+                    .foregroundStyle(.white)
+                    .frame(width: 22, height: 22)
+                    .background(
+                        isMenuHovered ? Color.white.opacity(0.14) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    )
+                    .contentShape(Rectangle())
             }
-            .menuStyle(.borderlessButton)
+            // .borderlessButton hides its own label until the row is hovered;
+            // .button + .plain keeps the glyph drawn at all times.
+            .menuStyle(.button)
+            .buttonStyle(.plain)
             .menuIndicator(.hidden)
             .fixedSize()
+            .layoutPriority(1)
+            .onHover { isMenuHovered = $0 }
+            .help("Agent actions")
         }
         .padding(.vertical, 4)
+        .padding(.horizontal, 6)
+        .background(
+            session.isSelected && !isArchived
+                ? Color.accentColor.opacity(0.12)
+                : Color.clear,
+            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+        )
         .contentShape(Rectangle())
         .onTapGesture {
             if !isArchived && !isRenaming { onFocus() }
@@ -206,6 +256,8 @@ private struct FleetAgentRow: View {
 
     @ViewBuilder
     private var lifecycleMenu: some View {
+        Button("Find Agent in Terminal", action: onFindInTerminal)
+        Divider()
         Button("Rename", action: beginRename)
         if session.worktree != nil {
             Button("Review Git Changes", action: onReview)
@@ -246,10 +298,6 @@ private struct FleetAgentRow: View {
         onRename(draftName)
         draftName = session.name
         isRenaming = false
-    }
-
-    private var providerColor: Color {
-        session.provider == .claude ? .orange : .green
     }
 
     private var installedIDEs: [ProjectIDE] {

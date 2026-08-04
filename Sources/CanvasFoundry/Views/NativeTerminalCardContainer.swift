@@ -128,8 +128,8 @@ final class NativeTerminalCardHost<Content: View>: NSView {
             hostingView.frame = bounds
         }
 
-        let headerHeight: CGFloat = 48
-        let menuExclusion: CGFloat = 54
+        let headerHeight: CGFloat = 38
+        let menuExclusion: CGFloat = 46
         dragRegion.frame = CGRect(
             x: 0,
             y: max(0, bounds.height - headerHeight),
