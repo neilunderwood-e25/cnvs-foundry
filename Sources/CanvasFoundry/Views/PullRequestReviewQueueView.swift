@@ -17,7 +17,7 @@ struct PullRequestReviewQueueView: View {
                     Image(systemName: "info.circle.fill")
                         .foregroundStyle(.orange)
                     Text(notice)
-                        .font(.callout)
+                        .font(.foundry(size: 13))
                         .textSelection(.enabled)
                     Spacer()
                     Button {
@@ -88,9 +88,9 @@ struct PullRequestReviewQueueView: View {
                 .foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Review Queue")
-                    .font(.title2.weight(.semibold))
+                    .font(.foundry(size: 20, weight: .semibold))
                 Text("Land agent work one pull request at a time")
-                    .font(.caption)
+                    .font(.foundry(size: 11))
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -128,14 +128,14 @@ private struct PullRequestQueueRow: View {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 7) {
                             Text(session.name)
-                                .font(.headline)
+                                .font(.foundry(size: 13, weight: .semibold))
                             Text("PR #\(pullRequest.number)")
                                 .font(.system(.caption, design: .monospaced, weight: .semibold))
                                 .foregroundStyle(.secondary)
                             queueBadge(pullRequest.queueState)
                         }
                         Text(pullRequest.title.isEmpty ? pullRequest.headBranch : pullRequest.title)
-                            .font(.callout)
+                            .font(.foundry(size: 13))
                             .lineLimit(2)
                         Text("\(pullRequest.headBranch) → \(pullRequest.baseBranch)")
                             .font(.system(size: 10.5, design: .monospaced))
@@ -166,7 +166,7 @@ private struct PullRequestQueueRow: View {
                     Label(pullRequest.checksStatus.label, systemImage: checksSymbol(pullRequest.checksStatus))
                     Label(pullRequest.reviewDecision.label, systemImage: "person.crop.circle.badge.checkmark")
                 }
-                .font(.caption)
+                .font(.foundry(size: 11))
                 .foregroundStyle(.secondary)
 
                 if !pullRequest.checks.isEmpty {
@@ -188,7 +188,7 @@ private struct PullRequestQueueRow: View {
                             .disabled(check.link == nil)
                         }
                     }
-                    .font(.caption2)
+                    .font(.foundry(size: 10))
                 }
 
                 HStack(spacing: 8) {
@@ -209,7 +209,7 @@ private struct PullRequestQueueRow: View {
 
                     Spacer()
                     Text("Updated \(pullRequest.updatedAt.formatted(date: .omitted, time: .shortened))")
-                        .font(.caption2)
+                        .font(.foundry(size: 10))
                         .foregroundStyle(.tertiary)
                 }
                 .disabled(session.isPublishingPullRequest)
@@ -228,7 +228,7 @@ private struct PullRequestQueueRow: View {
 
     private func queueBadge(_ state: PullRequestQueueState) -> some View {
         Text(state.label.uppercased())
-            .font(.system(size: 9, weight: .bold, design: .rounded))
+            .font(.foundry(size: 9, weight: .bold))
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .foregroundStyle(queueColor(state))

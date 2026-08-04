@@ -1,8 +1,19 @@
-import XCTest
+import AppKit
 import SwiftUI
+import XCTest
 @testable import CanvasFoundry
 
 final class CanvasFoundryTests: XCTestCase {
+    func testBundledBrandAssetsAndInterFontsLoad() {
+        FoundryBrand.registerBundledFonts()
+
+        XCTAssertNotNil(FoundryBrand.markImage)
+        XCTAssertNotNil(NSFont(name: "Inter-Regular", size: 13))
+        XCTAssertNotNil(NSFont(name: "Inter-Medium", size: 13))
+        XCTAssertNotNil(NSFont(name: "Inter-SemiBold", size: 13))
+        XCTAssertNotNil(NSFont(name: "Inter-Bold", size: 13))
+    }
+
     func testProviderLaunchPlansOpenInteractiveCLIs() {
         XCTAssertEqual(
             AgentProvider.claude.launchPlan(),

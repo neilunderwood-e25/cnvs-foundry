@@ -100,7 +100,7 @@ struct InfiniteCanvasView: View {
             Label("Drag the canvas to pan", systemImage: "hand.draw")
             Label("Pinch to zoom", systemImage: "plus.magnifyingglass")
         }
-        .font(.caption2)
+        .font(.foundry(size: 10))
         .foregroundStyle(.tertiary)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)

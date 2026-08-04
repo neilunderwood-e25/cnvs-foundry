@@ -69,7 +69,7 @@ struct AgentGitReviewView: View {
                 .foregroundStyle(session.provider == .claude ? .orange : .green)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Review \(session.name)")
-                    .font(.headline)
+                    .font(.foundry(size: 13, weight: .semibold))
                 Text(session.worktree?.branchName ?? "No worktree")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
@@ -149,7 +149,7 @@ struct AgentGitReviewView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     HStack {
                         Text("PATCH")
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .font(.foundry(size: 10, weight: .bold))
                             .tracking(1)
                         Spacer()
                         Text("base \(String(snapshot.baseRevision.prefix(8)))")
@@ -183,10 +183,10 @@ struct AgentGitReviewView: View {
     private func stat(_ value: String, label: String, color: Color) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(value)
-                .font(.system(size: 20, weight: .bold, design: .rounded))
+                .font(.foundry(size: 20, weight: .bold))
                 .foregroundStyle(color)
             Text(label)
-                .font(.caption)
+                .font(.foundry(size: 11))
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -236,7 +236,7 @@ struct AgentGitReviewView: View {
                             .disabled(isIntegrating)
                         }
                         Text(commit.subject)
-                            .font(.caption)
+                            .font(.foundry(size: 11))
                     }
                     .padding(.vertical, 3)
                 }
@@ -257,7 +257,7 @@ struct AgentGitReviewView: View {
             .disabled(snapshot.commits.isEmpty || isIntegrating)
 
             Text("Only committed work can be merged or cherry-picked. Uncommitted files stay in the agent worktree.")
-                .font(.caption2)
+                .font(.foundry(size: 10))
                 .foregroundStyle(.secondary)
         }
     }
@@ -282,7 +282,7 @@ struct AgentGitReviewView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(title)
-                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .font(.foundry(size: 10, weight: .bold))
                 .tracking(0.9)
                 .foregroundStyle(.secondary)
             content()
@@ -292,7 +292,7 @@ struct AgentGitReviewView: View {
 
     private func reviewBanner(_ message: String, color: Color) -> some View {
         Text(message)
-            .font(.caption)
+            .font(.foundry(size: 11))
             .foregroundStyle(color)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 16)
@@ -311,7 +311,7 @@ struct AgentGitReviewView: View {
             }
             Text(session.testStatus.label)
         }
-        .font(.caption)
+        .font(.foundry(size: 11))
         .foregroundStyle(.secondary)
     }
 

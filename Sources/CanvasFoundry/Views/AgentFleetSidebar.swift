@@ -7,11 +7,11 @@ struct AgentFleetSidebar: View {
         VStack(spacing: 0) {
             HStack {
                 Text("AGENTS")
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .font(.foundry(size: 11, weight: .bold))
                     .tracking(1.1)
                 Spacer()
                 Text("\(model.visibleSessions.count)")
-                    .font(.caption2.monospacedDigit())
+                    .font(.foundry(size: 10, weight: .medium).monospacedDigit())
                     .foregroundStyle(.secondary)
                 Button(action: model.refreshAllGitSummaries) {
                     Image(systemName: "arrow.clockwise")
@@ -54,7 +54,7 @@ struct AgentFleetSidebar: View {
         archived: Bool = false
     ) -> some View {
         if !sessions.isEmpty {
-            Section(title) {
+            Section {
                 ForEach(sessions) { session in
                     FleetAgentRow(
                         session: session,
@@ -71,6 +71,10 @@ struct AgentFleetSidebar: View {
                         onDelete: { model.prepareWorktreeDeletion(session) }
                     )
                 }
+            } header: {
+                Text(title)
+                    .font(.foundry(size: 10, weight: .bold))
+                    .tracking(0.8)
             }
         }
     }
@@ -137,13 +141,13 @@ private struct FleetAgentRow: View {
                 if isRenaming {
                     TextField("Agent name", text: $draftName)
                         .textFieldStyle(.plain)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.foundry(size: 12, weight: .semibold))
                         .focused($isNameFocused)
                         .onSubmit(commitRename)
                         .onExitCommand { isRenaming = false }
                 } else {
                     Text(session.name)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.foundry(size: 12, weight: .semibold))
                         .lineLimit(1)
                 }
 
@@ -152,7 +156,7 @@ private struct FleetAgentRow: View {
                         .fill(statusColor)
                         .frame(width: 5, height: 5)
                     Text(session.status.label)
-                        .font(.system(size: 9.5))
+                        .font(.foundry(size: 9.5))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -161,7 +165,7 @@ private struct FleetAgentRow: View {
 
             if let pullRequest = session.pullRequest {
                 Text(pullRequest.queueState.label.uppercased())
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .font(.foundry(size: 9, weight: .bold))
                     .foregroundStyle(pullRequestBadgeColor(pullRequest.queueState))
             }
 
@@ -170,7 +174,7 @@ private struct FleetAgentRow: View {
                     .controlSize(.mini)
             } else if session.gitSummary.changedFileCount > 0 {
                 Text("\(session.gitSummary.changedFileCount)")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .font(.foundry(size: 9, weight: .bold).monospacedDigit())
                     .padding(.horizontal, 6)
                     .padding(.vertical, 3)
                     .background(.orange.opacity(0.14), in: Capsule())

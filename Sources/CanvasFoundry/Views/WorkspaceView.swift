@@ -137,10 +137,9 @@ struct WorkspaceView: View {
     private var header: some View {
         HStack(spacing: 14) {
             HStack(spacing: 9) {
-                Image(systemName: "square.3.layers.3d.top.filled")
-                    .foregroundStyle(.orange)
+                FoundryMarkView(size: 20)
                 Text("CANVAS FOUNDRY")
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .font(.foundry(size: 13, weight: .bold))
                     .tracking(1.4)
             }
 
@@ -178,7 +177,7 @@ struct WorkspaceView: View {
 
             if !model.sessions.isEmpty {
                 Label("\(model.activeAgentCount) working", systemImage: "circle.hexagongrid.fill")
-                    .font(.caption)
+                    .font(.foundry(size: 11, weight: .medium))
                     .foregroundStyle(model.activeAgentCount > 0 ? .green : .secondary)
             }
 
@@ -268,11 +267,9 @@ private struct EmptyWorkspaceView: View {
 
     var body: some View {
         VStack(spacing: 18) {
-            Image(systemName: "point.3.connected.trianglepath.dotted")
-                .font(.system(size: 44, weight: .light))
-                .foregroundStyle(.orange)
+            FoundryMarkView(size: 56)
             Text("Your agents need a place to build")
-                .font(.system(size: 24, weight: .semibold, design: .rounded))
+                .font(.foundry(size: 24, weight: .semibold))
             Text("Choose a Git project or an empty folder to initialize locally. Every CLI agent gets its own branch and worktree.")
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

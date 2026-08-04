@@ -22,7 +22,10 @@ let package = Package(
             dependencies: [
                 .product(name: "SwiftTerm", package: "SwiftTerm")
             ],
-            path: "Sources/CanvasFoundry"
+            path: "Sources/CanvasFoundry",
+            resources: [
+                .process("Resources")
+            ]
         ),
         .testTarget(
             name: "CanvasFoundryTests",

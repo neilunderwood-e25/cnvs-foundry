@@ -5,9 +5,14 @@ import SwiftUI
 struct CanvasFoundryApp: App {
     @NSApplicationDelegateAdaptor(CanvasFoundryAppDelegate.self) private var appDelegate
 
+    init() {
+        FoundryBrand.registerBundledFonts()
+    }
+
     var body: some Scene {
         WindowGroup {
             WorkspaceView()
+                .font(.foundry(size: 13))
                 .preferredColorScheme(.dark)
                 .frame(minWidth: 980, minHeight: 680)
         }
@@ -19,6 +24,7 @@ struct CanvasFoundryApp: App {
 final class CanvasFoundryAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        FoundryBrand.applyApplicationIcon()
         NSApp.activate(ignoringOtherApps: true)
     }
 }

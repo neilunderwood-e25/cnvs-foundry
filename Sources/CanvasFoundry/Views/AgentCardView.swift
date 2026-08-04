@@ -47,10 +47,10 @@ struct AgentCardView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(session.name)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.foundry(size: 12, weight: .semibold))
                     .lineLimit(1)
                 Text(agentSubtitle)
-                    .font(.system(size: 10))
+                    .font(.foundry(size: 10))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -151,7 +151,7 @@ struct AgentCardView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.foundry(size: 11))
                     .padding(20)
                 }
             }
@@ -168,7 +168,7 @@ struct AgentCardView: View {
             if let pullRequest = session.pullRequest {
                 Button(action: onOpenPullRequest) {
                     Text(pullRequest.queueState.label.uppercased())
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .font(.foundry(size: 9, weight: .bold))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(pullRequestBadgeColor(pullRequest.queueState))
@@ -226,7 +226,7 @@ struct AgentCardView: View {
                 .frame(width: 6, height: 6)
             Text(session.status.label)
         }
-        .font(.system(size: 9, weight: .semibold))
+        .font(.foundry(size: 9, weight: .semibold))
         .foregroundStyle(statusColor)
         .padding(.horizontal, 8)
         .padding(.vertical, 5)

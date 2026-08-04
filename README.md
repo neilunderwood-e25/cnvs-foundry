@@ -11,6 +11,7 @@ An agent is an interactive CLI terminal session, not a prompt form. After choosi
 The first vertical slice is functional:
 
 - Native SwiftUI macOS application with a zoomable, pannable canvas.
+- Foundry visual identity with the supplied app/wordmark assets and bundled Inter typography.
 - Git project picker with local initialization for empty folders and unborn repositories.
 - Concurrent, interactive Claude Code and Codex PTY sessions.
 - A unique, stable call sign for every Claude Code and Codex agent.
