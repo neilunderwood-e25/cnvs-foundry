@@ -16,6 +16,7 @@ struct InfiniteCanvasView: View {
     @State private var editingText = ""
     @State private var editingColor: AnnotationColor = .chalk
     @FocusState private var isEditingTextFocused: Bool
+    @AppStorage(CommandBarVisibility.key) private var isCommandBarVisible = true
     @State private var selectDragMode: SelectDragMode?
     @State private var isMovingSelection = false
     @State private var marqueeRect: CGRect?
@@ -29,6 +30,16 @@ struct InfiniteCanvasView: View {
                     background: model.canvasBackground
                 )
                     .contentShape(Rectangle())
+                    .overlay {
+                        CanvasInputShim(
+                            cursor: model.activeTool.cursor,
+                            handlesScroll: { !isOverAgentCard($0) },
+                            onPan: { model.panBy($0) },
+                            onZoom: { factor, point in
+                                model.zoom(by: factor, anchoredAt: point)
+                            }
+                        )
+                    }
                     .gesture(panGesture)
                     .simultaneousGesture(zoomGesture)
                     .simultaneousGesture(canvasDragGesture)
@@ -78,6 +89,10 @@ struct InfiniteCanvasView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .offset(panTranslation)
+                // Cards step aside for every tool but select, so a stroke can
+                // cross a terminal without moving it — and the hand tool can pan
+                // from anywhere.
+                .allowsHitTesting(model.activeTool == .select)
 
                 if let editingTextID, let anchor = textEditorAnchor(for: editingTextID) {
                     inlineTextEditor(anchor: anchor)
@@ -93,6 +108,12 @@ struct InfiniteCanvasView: View {
                     CanvasToolPalette(model: model)
                         .padding(.leading, 14)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+
+                    if isCommandBarVisible {
+                        CommandBar(model: model, isVisible: $isCommandBarVisible)
+                            .padding(.bottom, 20)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    }
 
                     canvasZoomControls
                         .padding(18)
@@ -173,6 +194,23 @@ struct InfiniteCanvasView: View {
 
     /// Click radius in world units, so it feels the same at any zoom.
     private var hitTolerance: CGFloat { 9 / max(model.zoom, 0.01) }
+
+    /// Cards are laid out at a fixed size and only their centres scale, matching
+    /// how `CanvasAgentNode` positions them.
+    private func isOverAgentCard(_ screenPoint: CGPoint) -> Bool {
+        model.visibleSessions.contains { session in
+            let center = CGPoint(
+                x: session.position.x * model.zoom + model.pan.width,
+                y: session.position.y * model.zoom + model.pan.height
+            )
+            return CGRect(
+                x: center.x - session.size.width / 2,
+                y: center.y - session.size.height / 2,
+                width: session.size.width,
+                height: session.size.height
+            ).contains(screenPoint)
+        }
+    }
 
     private var isShiftHeld: Bool {
         NSEvent.modifierFlags.contains(.shift)
@@ -409,9 +447,9 @@ struct InfiniteCanvasView: View {
 
     private var canvasHint: some View {
         HStack(spacing: 12) {
+            Label("Scroll to pan", systemImage: "hand.draw")
+            Label("⌘-scroll to zoom", systemImage: "plus.magnifyingglass")
             Label("Drag to marquee-select", systemImage: "cursorarrow")
-            Label("Hand tool to pan", systemImage: "hand.raised")
-            Label("Pinch to zoom", systemImage: "plus.magnifyingglass")
         }
         .font(.foundry(size: 10))
         .foregroundStyle(.tertiary)

@@ -219,6 +219,215 @@ final class CanvasFoundryTests: XCTestCase {
         XCTAssertEqual(model.annotations.map(\.id), [stroke.id], "undo should restore the stroke")
     }
 
+    @MainActor
+    func testScrollPanningAndAnchoredZoomKeepThePointerFixed() {
+        let model = inkModel()
+        model.pan = CGSize(width: 180, height: 130)
+        model.zoom = 1
+
+        model.panBy(CGSize(width: -40, height: 25))
+        XCTAssertEqual(model.pan.width, 140, accuracy: 0.001)
+        XCTAssertEqual(model.pan.height, 155, accuracy: 0.001)
+
+        // Whatever sits under the cursor must not move while zooming, or
+        // scroll-zoom drifts away from what the user is pointing at.
+        let pointer = CGPoint(x: 620, y: 410)
+        let worldUnderPointer = CGPoint(
+            x: (pointer.x - model.pan.width) / model.zoom,
+            y: (pointer.y - model.pan.height) / model.zoom
+        )
+
+        model.zoom(by: 1.2, anchoredAt: pointer)
+        XCTAssertEqual(model.zoom, 1.2, accuracy: 0.001)
+        XCTAssertEqual(
+            worldUnderPointer.x * model.zoom + model.pan.width,
+            pointer.x,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            worldUnderPointer.y * model.zoom + model.pan.height,
+            pointer.y,
+            accuracy: 0.001
+        )
+
+        // Still fixed when zooming back out, and clamped at the limits.
+        model.zoom(by: 0.5, anchoredAt: pointer)
+        XCTAssertEqual(
+            worldUnderPointer.x * model.zoom + model.pan.width,
+            pointer.x,
+            accuracy: 0.001
+        )
+
+        for _ in 0..<40 { model.zoom(by: 1.25, anchoredAt: pointer) }
+        XCTAssertEqual(model.zoom, 1.8, accuracy: 0.001)
+        for _ in 0..<40 { model.zoom(by: 0.8, anchoredAt: pointer) }
+        XCTAssertEqual(model.zoom, 0.45, accuracy: 0.001)
+
+        // The anchor still holds after clamping, so the canvas cannot creep.
+        XCTAssertEqual(
+            worldUnderPointer.x * model.zoom + model.pan.width,
+            pointer.x,
+            accuracy: 0.001
+        )
+    }
+
+    func testToolCursorsDistinguishDrawingFromPanning() {
+        XCTAssertEqual(CanvasTool.select.cursor, NSCursor.arrow)
+        XCTAssertEqual(CanvasTool.hand.cursor, NSCursor.openHand)
+        XCTAssertEqual(CanvasTool.text.cursor, NSCursor.iBeam)
+        for tool in [CanvasTool.pen, .rectangle, .ellipse, .line, .arrow, .eraser] {
+            XCTAssertEqual(tool.cursor, NSCursor.crosshair, "\(tool) should draw with a crosshair")
+        }
+    }
+
+    func testCommandBarParsesTheHeadlineRequest() {
+        let plan = WorkspaceCommandParser.parse("add 3 claude agents and one code agent")
+
+        XCTAssertEqual(plan.commands, [
+            .createAgents(provider: .claude, count: 3),
+            .createAgents(provider: .codex, count: 1)
+        ])
+        XCTAssertTrue(plan.unrecognized.isEmpty)
+        XCTAssertEqual(plan.summary, "3 × Claude, 1 × Codex")
+    }
+
+    func testCommandBarHandlesCountsSynonymsAndSeparators() {
+        // Digits, number words and articles all mean a count.
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("spin up two codex terminals").commands,
+            [.createAgents(provider: .codex, count: 2)]
+        )
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("open a claude agent").commands,
+            [.createAgents(provider: .claude, count: 1)]
+        )
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("give me a couple of claude agents").commands,
+            [.createAgents(provider: .claude, count: 2)]
+        )
+
+        // Commas and "+" separate requests just like "and".
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("2 claude agents, 1 codex agent").commands,
+            [
+                .createAgents(provider: .claude, count: 2),
+                .createAgents(provider: .codex, count: 1)
+            ]
+        )
+
+        // Mishearings that dictation will produce constantly.
+        for spoken in ["add a cloud agent", "add a clawed agent", "add a claud agent"] {
+            XCTAssertEqual(
+                WorkspaceCommandParser.parse(spoken).commands,
+                [.createAgents(provider: .claude, count: 1)],
+                "\(spoken) should resolve to Claude"
+            )
+        }
+        for spoken in ["open one code agent", "open one coder agent", "open one openai agent"] {
+            XCTAssertEqual(
+                WorkspaceCommandParser.parse(spoken).commands,
+                [.createAgents(provider: .codex, count: 1)],
+                "\(spoken) should resolve to Codex"
+            )
+        }
+    }
+
+    func testCommandBarRefusesRunawayAndAmbiguousRequests() {
+        // Each agent is a worktree plus a process, so the count is clamped.
+        let runaway = WorkspaceCommandParser.parse("add 500 claude agents")
+        XCTAssertEqual(
+            runaway.commands,
+            [.createAgents(
+                provider: .claude,
+                count: WorkspaceCommandParser.maximumAgentsPerCommand
+            )]
+        )
+        XCTAssertFalse(runaway.notes.isEmpty, "clamping must be reported, not silent")
+
+        // A bare provider name is not an instruction.
+        XCTAssertTrue(WorkspaceCommandParser.parse("claude").isEmpty)
+
+        // Nonsense is reported rather than guessed at.
+        let nonsense = WorkspaceCommandParser.parse("make me a sandwich")
+        XCTAssertTrue(nonsense.isEmpty)
+        XCTAssertEqual(nonsense.unrecognized, ["make me a sandwich"])
+
+        // A good clause still runs when a sibling clause is gibberish.
+        let mixed = WorkspaceCommandParser.parse("add 2 codex agents and order pizza")
+        XCTAssertEqual(mixed.commands, [.createAgents(provider: .codex, count: 2)])
+        XCTAssertEqual(mixed.unrecognized, ["order pizza"])
+    }
+
+    func testCommandBarParsesCanvasAndNavigationVerbs() {
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("switch to plum").commands,
+            [.setBackground(.plum)]
+        )
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("make the background forest").commands,
+            [.setBackground(.forest)]
+        )
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("use the pen tool").commands,
+            [.selectTool(.pen)]
+        )
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("clear the drawings").commands,
+            [.clearDrawings]
+        )
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("reset the view").commands,
+            [.resetView]
+        )
+
+        // "reset" is shared between two verbs; the noun decides which.
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("reset the annotations").commands,
+            [.clearDrawings]
+        )
+
+        // Focus only matches an agent that exists, so stray names do nothing.
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("find ada", knownAgentNames: ["Ada", "Grace"]).commands,
+            [.focusAgent(name: "Ada")]
+        )
+        XCTAssertTrue(WorkspaceCommandParser.parse("find ada").isEmpty)
+
+        // A backdrop word must not hijack an agent request.
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("add an ink codex agent").commands,
+            [.createAgents(provider: .codex, count: 1)]
+        )
+    }
+
+    @MainActor
+    func testCommandExecutionDrivesTheWorkspace() {
+        let model = inkModel()
+
+        model.run(WorkspaceCommandParser.parse("switch to graphite and use the arrow tool"))
+        XCTAssertEqual(model.canvasBackground, .graphite)
+        XCTAssertEqual(model.activeTool, .arrow)
+
+        model.addAnnotation(
+            CanvasAnnotation(
+                kind: .line,
+                points: [CGPoint(x: 0, y: 0), CGPoint(x: 60, y: 0)],
+                color: .chalk
+            )
+        )
+        model.run(WorkspaceCommandParser.parse("clear the board"))
+        XCTAssertTrue(model.annotations.isEmpty)
+        // Clearing is undoable, which is why voice is allowed to do it.
+        model.undoAnnotationEdit()
+        XCTAssertEqual(model.annotations.count, 1)
+
+        // Asking for agents without a project explains itself instead of crashing.
+        XCTAssertNil(model.projectURL)
+        model.run(WorkspaceCommandParser.parse("add 3 claude agents"))
+        XCTAssertTrue(model.sessions.isEmpty)
+        XCTAssertNotNil(model.alertState)
+    }
+
     func testTextNoteBoxIsMeasuredAndGrowsWithLines() {
         FoundryBrand.registerBundledFonts()
 
@@ -697,6 +906,114 @@ final class CanvasFoundryTests: XCTestCase {
 
         runtime.stop()
         XCTAssertEqual(session.status, .stopped)
+    }
+
+    func testWorktreesLandBesideTheProjectWithReadableNames() async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CanvasFoundrySibling-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+
+        let repository = scratch.appendingPathComponent("acme-app", isDirectory: true)
+        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+
+        let shell = ShellRunner()
+        let git = URL(fileURLWithPath: "/usr/bin/git")
+        _ = try await shell.run(
+            executableURL: git,
+            arguments: ["init", "-b", "main"],
+            currentDirectoryURL: repository
+        )
+        _ = try await shell.run(
+            executableURL: git,
+            arguments: [
+                "-c", "user.name=Canvas Foundry Tests",
+                "-c", "user.email=tests@canvas.invalid",
+                "commit", "--allow-empty", "-m", "Initial commit"
+            ],
+            currentDirectoryURL: repository
+        )
+
+        // No storage override: the default must be `<parent>/acme-app-worktrees`.
+        let manager = GitWorktreeManager()
+        let first = try await manager.createWorktree(
+            for: repository,
+            sessionID: UUID(),
+            title: "Ada Claude"
+        )
+
+        XCTAssertEqual(
+            first.worktreeURL.deletingLastPathComponent().resolvingSymlinksInPath().path,
+            scratch.appendingPathComponent("acme-app-worktrees", isDirectory: true)
+                .resolvingSymlinksInPath().path,
+            "worktrees should sit in a sibling folder next to the project"
+        )
+        XCTAssertEqual(
+            first.worktreeURL.lastPathComponent,
+            "ada-claude",
+            "folders should carry the agent name, not a hash"
+        )
+
+        // The worktree must not leak into the project's own git status.
+        let status = try await shell.run(
+            executableURL: git,
+            arguments: ["status", "--porcelain=v1"],
+            currentDirectoryURL: repository
+        )
+        XCTAssertEqual(status.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines), "")
+
+        // A second agent with the same call sign must not collide.
+        let second = try await manager.createWorktree(
+            for: repository,
+            sessionID: UUID(),
+            title: "Ada Claude"
+        )
+        XCTAssertNotEqual(second.worktreeURL, first.worktreeURL)
+        XCTAssertTrue(second.worktreeURL.lastPathComponent.hasPrefix("ada-claude-"))
+
+        _ = try await shell.run(
+            executableURL: git,
+            arguments: ["worktree", "remove", "--force", first.worktreeURL.path],
+            currentDirectoryURL: repository
+        )
+        _ = try await shell.run(
+            executableURL: git,
+            arguments: ["worktree", "remove", "--force", second.worktreeURL.path],
+            currentDirectoryURL: repository
+        )
+    }
+
+    func testAgentIDEWorkspacePairsProjectWithBranchWithoutClobbering() throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CanvasFoundryWS-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let storage = scratch.appendingPathComponent("workspaces", isDirectory: true)
+        let project = scratch.appendingPathComponent("acme-app", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+
+        // Two agents on the same repository must get two distinct workspace
+        // files, or opening one editor window would rewrite the other's roots.
+        let adaURL = try IDEProjectOpener.makeMultiRootWorkspace(
+            projectURL: project,
+            folders: [.init(name: "Main", url: project)],
+            variant: "ada12345",
+            storageRoot: storage
+        )
+        let graceURL = try IDEProjectOpener.makeMultiRootWorkspace(
+            projectURL: project,
+            folders: [.init(name: "Main", url: project)],
+            variant: "grace678",
+            storageRoot: storage
+        )
+        XCTAssertNotEqual(adaURL, graceURL)
+
+        // And the fleet-wide workspace (no variant) keeps its own file.
+        let fleetURL = try IDEProjectOpener.makeMultiRootWorkspace(
+            projectURL: project,
+            folders: [.init(name: "Main", url: project)],
+            storageRoot: storage
+        )
+        XCTAssertNotEqual(fleetURL, adaURL)
+        XCTAssertNotEqual(fleetURL, graceURL)
     }
 
     func testCreatesARealIsolatedGitWorktree() async throws {

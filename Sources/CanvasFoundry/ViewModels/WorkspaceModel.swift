@@ -230,6 +230,16 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func openTerminal(provider: AgentProvider) {
+        createAgents(provider: provider, count: 1)
+    }
+
+    /// Opens `count` agents at once.
+    ///
+    /// Cards are staged synchronously so they all appear immediately and the
+    /// placement engine sees each previous one, but the worktrees are attached
+    /// one at a time: `GitWorktreeManager` is a plain struct, so several
+    /// concurrent `git worktree add` calls would contend on the same repository.
+    func createAgents(provider: AgentProvider, count: Int) {
         guard let projectURL else {
             alertState = .message("Choose a Git project before launching an agent.")
             return
@@ -241,6 +251,15 @@ final class WorkspaceModel: ObservableObject {
             return
         }
 
+        let staged = (0..<max(1, count)).map { _ in stageSession(provider: provider) }
+        Task {
+            for session in staged {
+                await activateSession(session, projectURL: projectURL)
+            }
+        }
+    }
+
+    private func stageSession(provider: AgentProvider) -> AgentSession {
         let terminalSize = CGSize(width: 520, height: 360)
         let occupiedRects = sessions.map { session in
             CGRect(
@@ -269,25 +288,26 @@ final class WorkspaceModel: ObservableObject {
         )
         sessions.append(session)
         select(session)
+        return session
+    }
 
-        Task {
-            do {
-                let descriptor = try await worktreeManager.createWorktree(
-                    for: projectURL,
-                    sessionID: session.id,
-                    title: "\(name)-\(provider.rawValue)"
-                )
-                session.worktree = descriptor
+    private func activateSession(_ session: AgentSession, projectURL: URL) async {
+        do {
+            let descriptor = try await worktreeManager.createWorktree(
+                for: projectURL,
+                sessionID: session.id,
+                title: "\(session.name)-\(session.provider.rawValue)"
+            )
+            session.worktree = descriptor
 
-                let runtime = try AgentTerminalRuntime(
-                    session: session,
-                    directory: descriptor.worktreeURL
-                )
-                session.runtime = runtime
-                refreshGitSummary(session)
-            } catch {
-                session.status = .failed(error.localizedDescription)
-            }
+            let runtime = try AgentTerminalRuntime(
+                session: session,
+                directory: descriptor.worktreeURL
+            )
+            session.runtime = runtime
+            refreshGitSummary(session)
+        } catch {
+            session.status = .failed(error.localizedDescription)
         }
     }
 
@@ -333,10 +353,27 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func openAgentWorktree(_ session: AgentSession, in ide: ProjectIDE) {
-        guard let worktreeURL = session.worktree?.worktreeURL else { return }
+        guard let descriptor = session.worktree else { return }
         Task {
             do {
-                try await IDEProjectOpener.open(projectURL: worktreeURL, in: ide)
+                // Opened as one workspace holding the project and the agent's
+                // branch, so the editor's source control panel can stage, commit
+                // and open a PR on the branch without losing project context.
+                let workspaceURL = try IDEProjectOpener.makeMultiRootWorkspace(
+                    projectURL: descriptor.projectRoot,
+                    folders: [
+                        .init(
+                            name: "Main — \(descriptor.projectRoot.lastPathComponent)",
+                            url: descriptor.projectRoot
+                        ),
+                        .init(
+                            name: "\(session.name) — \(session.provider.shortName)",
+                            url: descriptor.worktreeURL
+                        )
+                    ],
+                    variant: String(session.id.uuidString.lowercased().prefix(8))
+                )
+                try await IDEProjectOpener.open(projectURL: workspaceURL, in: ide)
             } catch {
                 alertState = .message(error.localizedDescription)
             }
@@ -590,6 +627,40 @@ final class WorkspaceModel: ObservableObject {
             width: viewportSize.width / 2 - session.position.x * zoom,
             height: viewportSize.height / 2 - session.position.y * zoom
         )
+    }
+
+    // MARK: - Command bar
+
+    /// Runs a parsed line. Returns the plan so the caller can echo what happened.
+    @discardableResult
+    func run(_ plan: WorkspaceCommandPlan) -> WorkspaceCommandPlan {
+        for command in plan.commands {
+            run(command)
+        }
+        return plan
+    }
+
+    func run(_ command: WorkspaceCommand) {
+        switch command {
+        case .createAgents(let provider, let count):
+            createAgents(provider: provider, count: count)
+        case .focusAgent(let name):
+            guard let session = sessions.first(where: {
+                $0.name.caseInsensitiveCompare(name) == .orderedSame
+            }) else {
+                alertState = .message("No agent named “\(name)” is on this canvas.")
+                return
+            }
+            revealTerminal(session)
+        case .setBackground(let background):
+            canvasBackground = background
+        case .selectTool(let tool):
+            activeTool = tool
+        case .clearDrawings:
+            clearAnnotations()
+        case .resetView:
+            resetView()
+        }
     }
 
     // MARK: - Canvas annotations
@@ -921,6 +992,28 @@ final class WorkspaceModel: ObservableObject {
     func resetView() {
         zoom = 1
         pan = CGSize(width: 180, height: 130)
+    }
+
+    func panBy(_ delta: CGSize) {
+        pan = CGSize(width: pan.width + delta.width, height: pan.height + delta.height)
+    }
+
+    /// Zooms about a point on screen, keeping whatever sits under the cursor
+    /// exactly where it is — otherwise scroll-zoom drifts the canvas away from
+    /// what the user is pointing at.
+    func zoom(by factor: CGFloat, anchoredAt screenPoint: CGPoint) {
+        let newZoom = min(1.8, max(0.45, zoom * factor))
+        guard abs(newZoom - zoom) > 0.0001 else { return }
+
+        let anchor = CGPoint(
+            x: (screenPoint.x - pan.width) / zoom,
+            y: (screenPoint.y - pan.height) / zoom
+        )
+        zoom = newZoom
+        pan = CGSize(
+            width: screenPoint.x - anchor.x * newZoom,
+            height: screenPoint.y - anchor.y * newZoom
+        )
     }
 
     func zoomIn() {

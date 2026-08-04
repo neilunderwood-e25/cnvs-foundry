@@ -4,6 +4,9 @@ import SwiftUI
 @main
 struct CanvasFoundryApp: App {
     @NSApplicationDelegateAdaptor(CanvasFoundryAppDelegate.self) private var appDelegate
+    /// Shared with the canvas through UserDefaults, so the menu item and the bar
+    /// itself stay in step.
+    @AppStorage(CommandBarVisibility.key) private var isCommandBarVisible = true
 
     init() {
         FoundryBrand.registerBundledFonts()
@@ -18,6 +21,14 @@ struct CanvasFoundryApp: App {
         }
         .windowToolbarStyle(.unifiedCompact(showsTitle: false))
         .defaultSize(width: 1440, height: 900)
+        .commands {
+            // A real menu command rather than a hidden button: the shortcut works
+            // regardless of what holds focus, and the binding is discoverable.
+            CommandGroup(after: .sidebar) {
+                Toggle("Command Bar", isOn: $isCommandBarVisible)
+                    .keyboardShortcut("k", modifiers: .command)
+            }
+        }
     }
 }
 
