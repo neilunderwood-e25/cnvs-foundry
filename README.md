@@ -16,6 +16,9 @@ The first vertical slice is functional:
 - A unique, stable call sign for every Claude Code and Codex agent.
 - Durable project, canvas, and agent-card state restored between app launches.
 - Explicit relaunching of restored agents in their existing worktrees.
+- Fleet sidebar with focus navigation, inline renaming, archive/restore, and guarded worktree removal.
+- Per-agent Git review with changed files, commits, patches, test execution, merge, and cherry-pick actions.
+- Main-project, per-agent worktree, and generated multi-root workspace launch in installed Cursor or Visual Studio Code applications.
 - One automatically-created branch and worktree per session.
 - Full ANSI color, keyboard input, selection, scrolling, resizing, and terminal escape-sequence support.
 - Draggable and resizable terminal cards.

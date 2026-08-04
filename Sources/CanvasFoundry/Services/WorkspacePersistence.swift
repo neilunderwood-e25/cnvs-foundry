@@ -38,6 +38,7 @@ struct PersistedAgentSession: Codable, Equatable {
     let positionY: Double
     let width: Double
     let height: Double
+    let isArchived: Bool?
     let worktree: PersistedWorktree?
 }
 
@@ -45,6 +46,7 @@ struct PersistedWorktree: Codable, Equatable {
     let projectRootPath: String
     let worktreePath: String
     let branchName: String
+    let baseRevision: String?
 }
 
 struct WorkspacePersistence: Sendable {

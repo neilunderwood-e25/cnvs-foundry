@@ -43,6 +43,29 @@ enum AgentStatus: Equatable {
     }
 }
 
+struct AgentGitSummary: Equatable {
+    var changedFileCount = 0
+    var commitCount = 0
+    var isRefreshing = false
+    var errorMessage: String?
+}
+
+enum AgentTestStatus: Equatable {
+    case notRun
+    case running
+    case passed
+    case failed(String)
+
+    var label: String {
+        switch self {
+        case .notRun: "Not run"
+        case .running: "Running"
+        case .passed: "Passed"
+        case .failed: "Failed"
+        }
+    }
+}
+
 @MainActor
 final class AgentSession: ObservableObject, Identifiable {
     let id: UUID
@@ -56,6 +79,9 @@ final class AgentSession: ObservableObject, Identifiable {
     @Published var size = CGSize(width: 520, height: 360)
     @Published var worktree: WorktreeDescriptor?
     @Published var isSelected = false
+    @Published var isArchived = false
+    @Published var gitSummary = AgentGitSummary()
+    @Published var testStatus: AgentTestStatus = .notRun
 
     @Published var runtime: AgentTerminalRuntime?
 

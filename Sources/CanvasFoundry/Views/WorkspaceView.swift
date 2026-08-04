@@ -8,18 +8,27 @@ struct WorkspaceView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            InfiniteCanvasView(model: model)
-                .overlay {
-                    if model.projectURL == nil {
-                        EmptyWorkspaceView {
-                            model.chooseProject()
+            HStack(spacing: 0) {
+                if model.projectURL != nil {
+                    AgentFleetSidebar(model: model)
+                    Divider().opacity(0.55)
+                }
+                InfiniteCanvasView(model: model)
+                    .overlay {
+                        if model.projectURL == nil {
+                            EmptyWorkspaceView {
+                                model.chooseProject()
+                            }
                         }
                     }
-                }
+            }
         }
         .background(Color(red: 0.035, green: 0.04, blue: 0.055))
         .onDisappear {
             model.persistWorkspace()
+        }
+        .task {
+            model.refreshAllGitSummaries()
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase != .active {
@@ -53,7 +62,39 @@ struct WorkspaceView: View {
                     },
                     secondaryButton: .cancel()
                 )
+            case .deleteWorktree(let request):
+                Alert(
+                    title: Text("Delete \(request.agentName)?"),
+                    message: Text(
+                        request.hasUncommittedChanges
+                            ? "This worktree contains uncommitted changes. Deleting it will permanently discard those changes. The Git branch will be kept."
+                            : "This removes the agent card and its worktree. The Git branch and its commits will be kept."
+                    ),
+                    primaryButton: .destructive(Text("Delete Worktree")) {
+                        model.deleteWorktree(request)
+                    },
+                    secondaryButton: .cancel()
+                )
+            case .switchProject(let request):
+                Alert(
+                    title: Text("Switch Projects?"),
+                    message: Text(
+                        "This replaces the current canvas containing \(request.existingAgentCount) agent\(request.existingAgentCount == 1 ? "" : "s"). Running agents will stop, but every branch and worktree will remain on disk."
+                    ),
+                    primaryButton: .destructive(Text("Switch Project")) {
+                        model.switchProject(request)
+                    },
+                    secondaryButton: .cancel()
+                )
             }
+        }
+        .sheet(item: $model.reviewingSession) { session in
+            AgentGitReviewView(
+                session: session,
+                service: model.gitReviewService,
+                onRepositoryChanged: model.refreshAllGitSummaries
+            )
+            .frame(minWidth: 940, minHeight: 680)
         }
     }
 
@@ -80,6 +121,10 @@ struct WorkspaceView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
+
+            if model.projectURL != nil {
+                IDELaunchButtons(model: model)
+            }
 
             Spacer()
 
@@ -121,6 +166,51 @@ struct WorkspaceView: View {
         .background(.ultraThinMaterial)
         .overlay(alignment: .bottom) {
             Divider().opacity(0.55)
+        }
+    }
+}
+
+private struct IDELaunchButtons: View {
+    @ObservedObject var model: WorkspaceModel
+
+    var body: some View {
+        ForEach(installedIDEs, id: \.ide.id) { application in
+            Menu {
+                Button {
+                    model.openProject(in: application.ide)
+                } label: {
+                    Label("Open Main Project", systemImage: "folder")
+                }
+                if !model.availableIDEWorktreeSessions.isEmpty {
+                    Button {
+                        model.openAllActiveWorktrees(in: application.ide)
+                    } label: {
+                        Label(
+                            "Open Main + \(model.availableIDEWorktreeSessions.count) Agent Worktree\(model.availableIDEWorktreeSessions.count == 1 ? "" : "s")",
+                            systemImage: "square.3.layers.3d"
+                        )
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(nsImage: application.icon)
+                        .resizable()
+                        .frame(width: 16, height: 16)
+                    Text(application.ide.buttonTitle)
+                        .lineLimit(1)
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Choose which worktrees to open in \(application.ide.buttonTitle)")
+        }
+    }
+
+    private var installedIDEs: [(ide: ProjectIDE, icon: NSImage)] {
+        ProjectIDE.allCases.compactMap { ide in
+            guard let applicationURL = ide.applicationURL() else { return nil }
+            let icon = NSWorkspace.shared.icon(forFile: applicationURL.path)
+            return (ide, icon)
         }
     }
 }

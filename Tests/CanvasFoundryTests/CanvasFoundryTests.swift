@@ -43,6 +43,47 @@ final class CanvasFoundryTests: XCTestCase {
         XCTAssertEqual(result?.path, "/bin/sh")
     }
 
+    func testGeneratedIDEWorkspaceContainsDistinctLabeledRoots() throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Canvas Foundry IDE-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+
+        let project = scratch.appendingPathComponent("Main Project", isDirectory: true)
+        let ada = scratch.appendingPathComponent("Ada Worktree", isDirectory: true)
+        let grace = scratch.appendingPathComponent("Grace Worktree", isDirectory: true)
+        let storage = scratch.appendingPathComponent("Generated Workspaces", isDirectory: true)
+        for directory in [project, ada, grace] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+
+        let workspaceURL = try IDEProjectOpener.makeMultiRootWorkspace(
+            projectURL: project,
+            folders: [
+                .init(name: "Main — Main Project", url: project),
+                .init(name: "Ada — Claude", url: ada),
+                .init(name: "Grace — Codex", url: grace),
+                .init(name: "Duplicate Ada", url: ada)
+            ],
+            storageRoot: storage
+        )
+
+        XCTAssertEqual(workspaceURL.pathExtension, "code-workspace")
+        XCTAssertEqual(workspaceURL.deletingLastPathComponent(), storage)
+
+        let data = try Data(contentsOf: workspaceURL)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        let folders = try XCTUnwrap(json["folders"] as? [[String: String]])
+        XCTAssertEqual(folders.count, 3)
+        XCTAssertEqual(folders.compactMap { $0["name"] }, [
+            "Main — Main Project", "Ada — Claude", "Grace — Codex"
+        ])
+        XCTAssertEqual(folders.compactMap { $0["path"] }, [
+            project.path, ada.path, grace.path
+        ])
+    }
+
     func testCanvasPlacementAvoidsExistingTerminalFrames() {
         let itemSize = CGSize(width: 520, height: 360)
         let firstCenter = CanvasPlacementEngine.nextCenter(
@@ -120,7 +161,8 @@ final class CanvasFoundryTests: XCTestCase {
         sourceSession.worktree = WorktreeDescriptor(
             projectRoot: project,
             worktreeURL: worktree,
-            branchName: "canvas/grace-codex-12345678"
+            branchName: "canvas/grace-codex-12345678",
+            baseRevision: "deadbeef"
         )
         sourceModel.sessions = [sourceSession]
         sourceModel.select(sourceSession)
@@ -140,9 +182,60 @@ final class CanvasFoundryTests: XCTestCase {
         XCTAssertEqual(restored.position, CGPoint(x: 510, y: 420))
         XCTAssertEqual(restored.size, CGSize(width: 680, height: 440))
         XCTAssertEqual(restored.worktree?.branchName, "canvas/grace-codex-12345678")
+        XCTAssertEqual(restored.worktree?.baseRevision, "deadbeef")
         XCTAssertEqual(restored.status, .stopped)
         XCTAssertTrue(restored.isSelected)
         XCTAssertNil(restored.runtime)
+    }
+
+    @MainActor
+    func testFleetRenameArchiveAndRestoreLifecycle() throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CanvasFoundryFleet-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+
+        let persistence = WorkspacePersistence(
+            fileURL: scratch.appendingPathComponent("workspace.json")
+        )
+        let model = WorkspaceModel(persistence: persistence)
+        model.projectURL = scratch
+
+        let ada = AgentSession(provider: .claude, name: "Ada", position: .zero)
+        let grace = AgentSession(provider: .codex, name: "Grace", position: .zero)
+        ada.status = .stopped
+        grace.status = .stopped
+        model.sessions = [ada, grace]
+
+        model.rename(grace, to: "Ada")
+        XCTAssertEqual(grace.name, "Ada 2")
+
+        model.archive(ada)
+        XCTAssertTrue(ada.isArchived)
+        XCTAssertEqual(model.visibleSessions.map(\.id), [grace.id])
+
+        model.restore(ada)
+        XCTAssertFalse(ada.isArchived)
+        XCTAssertEqual(model.selectedSessionID, ada.id)
+        XCTAssertEqual(model.visibleSessions.count, 2)
+
+        model.archive(ada)
+        model.persistWorkspace()
+        let restoredModel = WorkspaceModel(persistence: persistence)
+        XCTAssertTrue(try XCTUnwrap(restoredModel.sessions.first { $0.id == ada.id }).isArchived)
+        XCTAssertFalse(restoredModel.visibleSessions.contains { $0.id == ada.id })
+
+        let nextProject = scratch.appendingPathComponent("next-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: nextProject, withIntermediateDirectories: true)
+        restoredModel.switchProject(
+            ProjectSwitchRequest(
+                projectURL: nextProject,
+                existingAgentCount: restoredModel.sessions.count
+            )
+        )
+        XCTAssertEqual(restoredModel.projectURL, nextProject)
+        XCTAssertTrue(restoredModel.sessions.isEmpty)
+        XCTAssertNil(restoredModel.selectedSessionID)
     }
 
     @MainActor
@@ -213,6 +306,7 @@ final class CanvasFoundryTests: XCTestCase {
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: descriptor.worktreeURL.path))
         XCTAssertEqual(descriptor.branchName, "canvas/implement-settings-12345678")
+        XCTAssertNotNil(descriptor.baseRevision)
 
         let branchResult = try await shell.run(
             executableURL: git,
@@ -223,6 +317,104 @@ final class CanvasFoundryTests: XCTestCase {
             branchResult.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines),
             descriptor.branchName
         )
+    }
+
+    func testGitReviewMergeAndGuardedWorktreeRemoval() async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CanvasFoundryReview-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+
+        let repository = scratch.appendingPathComponent("project", isDirectory: true)
+        let worktreeStorage = scratch.appendingPathComponent("worktrees", isDirectory: true)
+        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+
+        let shell = ShellRunner()
+        let git = URL(fileURLWithPath: "/usr/bin/git")
+        let initResult = try await shell.run(
+            executableURL: git,
+            arguments: ["init", "-b", "main"],
+            currentDirectoryURL: repository
+        )
+        XCTAssertEqual(initResult.exitCode, 0)
+        let initialCommit = try await shell.run(
+            executableURL: git,
+            arguments: [
+                "-c", "user.name=Canvas Foundry Tests",
+                "-c", "user.email=tests@canvas.invalid",
+                "commit", "--allow-empty", "-m", "Initial commit"
+            ],
+            currentDirectoryURL: repository
+        )
+        XCTAssertEqual(initialCommit.exitCode, 0, initialCommit.standardError)
+
+        let manager = GitWorktreeManager(storageRoot: worktreeStorage)
+        let descriptor = try await manager.createWorktree(
+            for: repository,
+            sessionID: UUID(),
+            title: "Grace Codex"
+        )
+
+        try Data("reviewed feature\n".utf8).write(
+            to: descriptor.worktreeURL.appendingPathComponent("feature.txt")
+        )
+        let featureCommit = try await shell.run(
+            executableURL: git,
+            arguments: [
+                "add", "feature.txt"
+            ],
+            currentDirectoryURL: descriptor.worktreeURL
+        )
+        XCTAssertEqual(featureCommit.exitCode, 0, featureCommit.standardError)
+        let commitResult = try await shell.run(
+            executableURL: git,
+            arguments: [
+                "-c", "user.name=Grace",
+                "-c", "user.email=grace@canvas.invalid",
+                "commit", "-m", "Add reviewed feature"
+            ],
+            currentDirectoryURL: descriptor.worktreeURL
+        )
+        XCTAssertEqual(commitResult.exitCode, 0, commitResult.standardError)
+        try Data("uncommitted note\n".utf8).write(
+            to: descriptor.worktreeURL.appendingPathComponent("notes.txt")
+        )
+
+        let reviewService = GitReviewService()
+        let review = try await reviewService.inspect(descriptor)
+        XCTAssertEqual(Set(review.files.map(\.path)), ["feature.txt", "notes.txt"])
+        XCTAssertEqual(review.commits.count, 1)
+        XCTAssertEqual(review.commits.first?.subject, "Add reviewed feature")
+        XCTAssertTrue(review.diff.contains("reviewed feature"))
+        XCTAssertTrue(review.diff.contains("notes.txt"))
+
+        let summary = try await reviewService.summary(descriptor)
+        XCTAssertEqual(summary.changedFileCount, 2)
+        XCTAssertEqual(summary.commitCount, 1)
+
+        try await reviewService.mergeAgentBranch(descriptor)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: repository.appendingPathComponent("feature.txt").path
+            )
+        )
+
+        let hasUncommittedChanges = try await manager.hasUncommittedChanges(descriptor)
+        XCTAssertTrue(hasUncommittedChanges)
+        do {
+            try await manager.removeWorktree(descriptor, force: false)
+            XCTFail("A dirty worktree must not be removed without force")
+        } catch {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: descriptor.worktreeURL.path))
+        }
+
+        try await manager.removeWorktree(descriptor, force: true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: descriptor.worktreeURL.path))
+        let branchResult = try await shell.run(
+            executableURL: git,
+            arguments: ["show-ref", "--verify", "refs/heads/\(descriptor.branchName)"],
+            currentDirectoryURL: repository
+        )
+        XCTAssertEqual(branchResult.exitCode, 0, "Removing a worktree must preserve its branch")
     }
 
     func testEmptyFolderCanBeInitializedForAgentWorktrees() async throws {

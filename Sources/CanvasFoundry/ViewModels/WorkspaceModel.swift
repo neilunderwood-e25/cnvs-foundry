@@ -47,6 +47,8 @@ enum CanvasPlacementEngine {
 enum WorkspaceAlertState: Identifiable, Equatable {
     case message(String)
     case bootstrap(RepositoryBootstrapRequest)
+    case deleteWorktree(WorktreeDeletionRequest)
+    case switchProject(ProjectSwitchRequest)
 
     var id: String {
         switch self {
@@ -54,8 +56,23 @@ enum WorkspaceAlertState: Identifiable, Equatable {
             "message-\(message)"
         case .bootstrap(let request):
             "bootstrap-\(request.folderURL.path)-\(request.shouldInitializeGit)"
+        case .deleteWorktree(let request):
+            "delete-worktree-\(request.sessionID)-\(request.hasUncommittedChanges)"
+        case .switchProject(let request):
+            "switch-project-\(request.projectURL.path)"
         }
     }
+}
+
+struct WorktreeDeletionRequest: Equatable {
+    let sessionID: UUID
+    let agentName: String
+    let hasUncommittedChanges: Bool
+}
+
+struct ProjectSwitchRequest: Equatable {
+    let projectURL: URL
+    let existingAgentCount: Int
 }
 
 @MainActor
@@ -79,10 +96,12 @@ final class WorkspaceModel: ObservableObject {
         didSet { schedulePersistence() }
     }
     @Published var alertState: WorkspaceAlertState?
+    @Published var reviewingSession: AgentSession?
 
     private let worktreeManager: GitWorktreeManager
     private let projectManager: GitProjectManager
     private let persistence: WorkspacePersistence
+    let gitReviewService: GitReviewService
     private var viewportSize = CGSize(width: 1200, height: 760)
     private var sessionObservers: [UUID: AnyCancellable] = [:]
     private var persistenceTask: Task<Void, Never>?
@@ -91,18 +110,31 @@ final class WorkspaceModel: ObservableObject {
     init(
         worktreeManager: GitWorktreeManager = GitWorktreeManager(),
         projectManager: GitProjectManager = GitProjectManager(),
-        persistence: WorkspacePersistence = WorkspacePersistence()
+        persistence: WorkspacePersistence = WorkspacePersistence(),
+        gitReviewService: GitReviewService = GitReviewService()
     ) {
         self.worktreeManager = worktreeManager
         self.projectManager = projectManager
         self.persistence = persistence
+        self.gitReviewService = gitReviewService
         restoreWorkspace()
         isRestoring = false
         observeSessions()
     }
 
     var activeAgentCount: Int {
-        sessions.filter { $0.status.isActive }.count
+        sessions.filter { !$0.isArchived && $0.status.isActive }.count
+    }
+
+    var visibleSessions: [AgentSession] {
+        sessions.filter { !$0.isArchived }
+    }
+
+    var availableIDEWorktreeSessions: [AgentSession] {
+        visibleSessions.filter { session in
+            guard let path = session.worktree?.worktreeURL.path else { return false }
+            return FileManager.default.fileExists(atPath: path)
+        }
     }
 
     func chooseProject() {
@@ -123,7 +155,7 @@ final class WorkspaceModel: ObservableObject {
         alertState = nil
         Task {
             do {
-                projectURL = try await projectManager.bootstrap(request)
+                activateProject(try await projectManager.bootstrap(request))
             } catch {
                 alertState = .message(error.localizedDescription)
             }
@@ -185,8 +217,61 @@ final class WorkspaceModel: ObservableObject {
                     directory: descriptor.worktreeURL
                 )
                 session.runtime = runtime
+                refreshGitSummary(session)
             } catch {
                 session.status = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    func openProject(in ide: ProjectIDE) {
+        guard let projectURL else { return }
+        Task {
+            do {
+                try await IDEProjectOpener.open(projectURL: projectURL, in: ide)
+            } catch {
+                alertState = .message(error.localizedDescription)
+            }
+        }
+    }
+
+    func openAllActiveWorktrees(in ide: ProjectIDE) {
+        guard let projectURL else { return }
+        let agentFolders = availableIDEWorktreeSessions.compactMap {
+            session -> IDEProjectOpener.WorkspaceFolder? in
+            guard let worktreeURL = session.worktree?.worktreeURL else { return nil }
+            return IDEProjectOpener.WorkspaceFolder(
+                name: "\(session.name) — \(session.provider.shortName)",
+                url: worktreeURL
+            )
+        }
+        let folders = [
+            IDEProjectOpener.WorkspaceFolder(
+                name: "Main — \(projectURL.lastPathComponent)",
+                url: projectURL
+            )
+        ] + agentFolders
+
+        Task {
+            do {
+                let workspaceURL = try IDEProjectOpener.makeMultiRootWorkspace(
+                    projectURL: projectURL,
+                    folders: folders
+                )
+                try await IDEProjectOpener.open(projectURL: workspaceURL, in: ide)
+            } catch {
+                alertState = .message(error.localizedDescription)
+            }
+        }
+    }
+
+    func openAgentWorktree(_ session: AgentSession, in ide: ProjectIDE) {
+        guard let worktreeURL = session.worktree?.worktreeURL else { return }
+        Task {
+            do {
+                try await IDEProjectOpener.open(projectURL: worktreeURL, in: ide)
+            } catch {
+                alertState = .message(error.localizedDescription)
             }
         }
     }
@@ -217,6 +302,135 @@ final class WorkspaceModel: ObservableObject {
         } catch {
             session.status = .failed(error.localizedDescription)
         }
+    }
+
+    func focus(_ session: AgentSession) {
+        guard !session.isArchived else { return }
+        select(session)
+        pan = CGSize(
+            width: viewportSize.width / 2 - session.position.x * zoom,
+            height: viewportSize.height / 2 - session.position.y * zoom
+        )
+        refreshGitSummary(session)
+    }
+
+    func rename(_ session: AgentSession, to proposedName: String) {
+        let trimmed = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let occupiedNames = Set(
+            sessions
+                .filter { $0.id != session.id }
+                .map { $0.name.lowercased() }
+        )
+        var resolvedName = trimmed
+        var suffix = 2
+        while occupiedNames.contains(resolvedName.lowercased()) {
+            resolvedName = "\(trimmed) \(suffix)"
+            suffix += 1
+        }
+        session.name = resolvedName
+    }
+
+    func archive(_ session: AgentSession) {
+        session.runtime?.stop()
+        session.isArchived = true
+        if selectedSessionID == session.id {
+            select(nil)
+        }
+    }
+
+    func restore(_ session: AgentSession) {
+        session.isArchived = false
+        focus(session)
+    }
+
+    func prepareWorktreeDeletion(_ session: AgentSession) {
+        guard let descriptor = session.worktree else {
+            sessions.removeAll { $0.id == session.id }
+            return
+        }
+
+        Task {
+            do {
+                let hasChanges = try await worktreeManager.hasUncommittedChanges(descriptor)
+                alertState = .deleteWorktree(
+                    WorktreeDeletionRequest(
+                        sessionID: session.id,
+                        agentName: session.name,
+                        hasUncommittedChanges: hasChanges
+                    )
+                )
+            } catch {
+                alertState = .message(error.localizedDescription)
+            }
+        }
+    }
+
+    func review(_ session: AgentSession) {
+        reviewingSession = session
+        refreshGitSummary(session)
+    }
+
+    func refreshGitSummary(_ session: AgentSession) {
+        guard let descriptor = session.worktree,
+              FileManager.default.fileExists(atPath: descriptor.worktreeURL.path),
+              !session.gitSummary.isRefreshing else {
+            return
+        }
+
+        session.gitSummary.isRefreshing = true
+        session.gitSummary.errorMessage = nil
+        Task {
+            do {
+                session.gitSummary = try await gitReviewService.summary(descriptor)
+            } catch {
+                session.gitSummary = AgentGitSummary(errorMessage: error.localizedDescription)
+            }
+        }
+    }
+
+    func refreshAllGitSummaries() {
+        for session in sessions where !session.isArchived {
+            refreshGitSummary(session)
+        }
+    }
+
+    func deleteWorktree(_ request: WorktreeDeletionRequest) {
+        alertState = nil
+        guard let session = sessions.first(where: { $0.id == request.sessionID }),
+              let descriptor = session.worktree else {
+            return
+        }
+
+        session.runtime?.stop()
+        Task {
+            do {
+                try await worktreeManager.removeWorktree(
+                    descriptor,
+                    force: request.hasUncommittedChanges
+                )
+                sessions.removeAll { $0.id == request.sessionID }
+                if selectedSessionID == request.sessionID {
+                    select(nil)
+                }
+            } catch {
+                alertState = .message(error.localizedDescription)
+            }
+        }
+    }
+
+    func switchProject(_ request: ProjectSwitchRequest) {
+        alertState = nil
+        for session in sessions {
+            session.runtime?.stop()
+        }
+        reviewingSession = nil
+        sessions = []
+        selectedSessionID = nil
+        zoom = 1
+        pan = CGSize(width: 180, height: 130)
+        projectURL = request.projectURL
     }
 
     func select(_ session: AgentSession?) {
@@ -259,7 +473,7 @@ final class WorkspaceModel: ObservableObject {
             do {
                 switch try await projectManager.inspect(selectedURL) {
                 case .ready(let rootURL):
-                    projectURL = rootURL
+                    activateProject(rootURL)
                 case .needsBootstrap(let request):
                     alertState = .bootstrap(request)
                 case .unsupported(let message):
@@ -268,6 +482,22 @@ final class WorkspaceModel: ObservableObject {
             } catch {
                 alertState = .message(error.localizedDescription)
             }
+        }
+    }
+
+    private func activateProject(_ rootURL: URL) {
+        let normalizedRoot = rootURL.standardizedFileURL
+        if projectURL?.standardizedFileURL == normalizedRoot {
+            projectURL = normalizedRoot
+        } else if sessions.isEmpty {
+            projectURL = normalizedRoot
+        } else {
+            alertState = .switchProject(
+                ProjectSwitchRequest(
+                    projectURL: normalizedRoot,
+                    existingAgentCount: sessions.count
+                )
+            )
         }
     }
 
@@ -292,7 +522,7 @@ final class WorkspaceModel: ObservableObject {
         sessions = snapshot.sessions.compactMap(restoreSession)
 
         if let selectedID = snapshot.selectedSessionID,
-           let selectedSession = sessions.first(where: { $0.id == selectedID }) {
+           let selectedSession = sessions.first(where: { $0.id == selectedID && !$0.isArchived }) {
             selectedSessionID = selectedID
             selectedSession.isSelected = true
         }
@@ -311,11 +541,13 @@ final class WorkspaceModel: ObservableObject {
             width: max(420, stored.width),
             height: max(280, stored.height)
         )
+        session.isArchived = stored.isArchived ?? false
         if let worktree = stored.worktree {
             session.worktree = WorktreeDescriptor(
                 projectRoot: URL(fileURLWithPath: worktree.projectRootPath, isDirectory: true),
                 worktreeURL: URL(fileURLWithPath: worktree.worktreePath, isDirectory: true),
-                branchName: worktree.branchName
+                branchName: worktree.branchName,
+                baseRevision: worktree.baseRevision
             )
             session.status = FileManager.default.fileExists(atPath: worktree.worktreePath)
                 ? .stopped
@@ -342,11 +574,13 @@ final class WorkspaceModel: ObservableObject {
                     positionY: Double(session.position.y),
                     width: Double(session.size.width),
                     height: Double(session.size.height),
+                    isArchived: session.isArchived,
                     worktree: session.worktree.map { worktree in
                         PersistedWorktree(
                             projectRootPath: worktree.projectRoot.path,
                             worktreePath: worktree.worktreeURL.path,
-                            branchName: worktree.branchName
+                            branchName: worktree.branchName,
+                            baseRevision: worktree.baseRevision
                         )
                     }
                 )

@@ -5,6 +5,10 @@ struct AgentCardView: View {
     @ObservedObject var session: AgentSession
     let onSelect: () -> Void
     let onRelaunch: () -> Void
+    let onReview: () -> Void
+    let onArchive: () -> Void
+    let onDelete: () -> Void
+    let onOpenInIDE: (ProjectIDE) -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -62,6 +66,14 @@ struct AgentCardView: View {
                     }
                 }
                 if let worktree = session.worktree {
+                    Button("Review Git Changes") {
+                        onReview()
+                    }
+                    ForEach(installedIDEs) { ide in
+                        Button("Open \(session.name) Worktree in \(ide.shortDisplayName)") {
+                            onOpenInIDE(ide)
+                        }
+                    }
                     Button("Reveal Worktree in Finder") {
                         NSWorkspace.shared.activateFileViewerSelecting([worktree.worktreeURL])
                     }
@@ -77,6 +89,10 @@ struct AgentCardView: View {
                         )
                     }
                 }
+                Divider()
+                Button("Archive Agent", action: onArchive)
+                Button("Delete Agent and Worktree", role: .destructive, action: onDelete)
+                    .disabled(session.worktree == nil)
             } label: {
                 Image(systemName: "ellipsis")
                     .frame(width: 22, height: 22)
@@ -135,6 +151,17 @@ struct AgentCardView: View {
             Text(session.worktree?.branchName ?? "allocating worktree")
                 .lineLimit(1)
             Spacer()
+            if session.gitSummary.changedFileCount > 0 {
+                Button(action: onReview) {
+                    Label(
+                        "\(session.gitSummary.changedFileCount)",
+                        systemImage: "doc.badge.ellipsis"
+                    )
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.orange)
+                .help("Review changed files")
+            }
             if session.status.isActive {
                 Button {
                     session.runtime?.stop()
@@ -198,6 +225,10 @@ struct AgentCardView: View {
             return session.provider.displayName
         }
         return "\(session.provider.displayName) · \(terminalTitle)"
+    }
+
+    private var installedIDEs: [ProjectIDE] {
+        ProjectIDE.allCases.filter { $0.applicationURL() != nil }
     }
 
     private var statusColor: Color {

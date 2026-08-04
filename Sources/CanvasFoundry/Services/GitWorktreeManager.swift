@@ -4,6 +4,19 @@ struct WorktreeDescriptor: Equatable, Sendable {
     let projectRoot: URL
     let worktreeURL: URL
     let branchName: String
+    let baseRevision: String?
+
+    init(
+        projectRoot: URL,
+        worktreeURL: URL,
+        branchName: String,
+        baseRevision: String? = nil
+    ) {
+        self.projectRoot = projectRoot
+        self.worktreeURL = worktreeURL
+        self.branchName = branchName
+        self.baseRevision = baseRevision
+    }
 }
 
 enum WorktreeError: LocalizedError {
@@ -45,6 +58,16 @@ struct GitWorktreeManager: Sendable {
 
         let rootPath = rootResult.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
         let projectRoot = URL(fileURLWithPath: rootPath, isDirectory: true)
+        let baseResult = try await shell.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: ["rev-parse", "HEAD"],
+            currentDirectoryURL: projectRoot
+        )
+        guard baseResult.exitCode == 0 else {
+            throw WorktreeError.commandFailed(Self.commandDetails(baseResult))
+        }
+        let baseRevision = baseResult.standardOutput
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let shortID = sessionID.uuidString.lowercased().prefix(8)
         let branchName = "canvas/\(Self.slug(title))-\(shortID)"
         let repositoryKey = "\(Self.slug(projectRoot.lastPathComponent))-\(Self.fnv1a(projectRoot.path))"
@@ -71,8 +94,47 @@ struct GitWorktreeManager: Sendable {
         return WorktreeDescriptor(
             projectRoot: projectRoot,
             worktreeURL: worktreeURL,
-            branchName: branchName
+            branchName: branchName,
+            baseRevision: baseRevision
         )
+    }
+
+    func hasUncommittedChanges(_ descriptor: WorktreeDescriptor) async throws -> Bool {
+        guard FileManager.default.fileExists(atPath: descriptor.worktreeURL.path) else {
+            return false
+        }
+        let result = try await shell.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: ["status", "--porcelain=v1"],
+            currentDirectoryURL: descriptor.worktreeURL
+        )
+        guard result.exitCode == 0 else {
+            throw WorktreeError.commandFailed(Self.commandDetails(result))
+        }
+        return !result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func removeWorktree(
+        _ descriptor: WorktreeDescriptor,
+        force: Bool
+    ) async throws {
+        guard FileManager.default.fileExists(atPath: descriptor.worktreeURL.path) else {
+            return
+        }
+        var arguments = ["worktree", "remove"]
+        if force {
+            arguments.append("--force")
+        }
+        arguments.append(descriptor.worktreeURL.path)
+
+        let result = try await shell.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: arguments,
+            currentDirectoryURL: descriptor.projectRoot
+        )
+        guard result.exitCode == 0 else {
+            throw WorktreeError.commandFailed(Self.commandDetails(result))
+        }
     }
 
     static func slug(_ value: String) -> String {
@@ -102,5 +164,12 @@ struct GitWorktreeManager: Sendable {
         return applicationSupport
             .appendingPathComponent("CanvasFoundry", isDirectory: true)
             .appendingPathComponent("Worktrees", isDirectory: true)
+    }
+
+    private static func commandDetails(_ result: CommandResult) -> String {
+        let details = result.standardError.isEmpty
+            ? result.standardOutput
+            : result.standardError
+        return details.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

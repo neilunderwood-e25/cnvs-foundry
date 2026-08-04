@@ -39,9 +39,15 @@ struct ShellRunner: Sendable {
                 throw ShellRunnerError.couldNotLaunch(error.localizedDescription)
             }
 
+            let outputTask = Task.detached {
+                outputPipe.fileHandleForReading.readDataToEndOfFile()
+            }
+            let errorTask = Task.detached {
+                errorPipe.fileHandleForReading.readDataToEndOfFile()
+            }
             process.waitUntilExit()
-            let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-            let error = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            let output = await outputTask.value
+            let error = await errorTask.value
 
             return CommandResult(
                 exitCode: process.terminationStatus,

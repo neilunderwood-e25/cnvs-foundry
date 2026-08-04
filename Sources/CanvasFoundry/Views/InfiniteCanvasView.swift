@@ -15,7 +15,7 @@ struct InfiniteCanvasView: View {
                     .simultaneousGesture(zoomGesture)
 
                 ZStack(alignment: .topLeading) {
-                    ForEach(model.sessions) { session in
+                    ForEach(model.visibleSessions) { session in
                         CanvasAgentNode(
                             session: session,
                             zoom: effectiveZoom,
@@ -24,6 +24,14 @@ struct InfiniteCanvasView: View {
                             model.select(session)
                         } onRelaunch: {
                             model.relaunch(session)
+                        } onReview: {
+                            model.review(session)
+                        } onArchive: {
+                            model.archive(session)
+                        } onDelete: {
+                            model.prepareWorktreeDeletion(session)
+                        } onOpenInIDE: { ide in
+                            model.openAgentWorktree(session, in: ide)
                         }
                     }
                 }
@@ -100,13 +108,21 @@ private struct CanvasAgentNode: View {
     let pan: CGSize
     let onSelect: () -> Void
     let onRelaunch: () -> Void
+    let onReview: () -> Void
+    let onArchive: () -> Void
+    let onDelete: () -> Void
+    let onOpenInIDE: (ProjectIDE) -> Void
 
     var body: some View {
         NativeTerminalCardContainer(
             content: AgentCardView(
                 session: session,
                 onSelect: onSelect,
-                onRelaunch: onRelaunch
+                onRelaunch: onRelaunch,
+                onReview: onReview,
+                onArchive: onArchive,
+                onDelete: onDelete,
+                onOpenInIDE: onOpenInIDE
             ),
             onInteractionBegan: onSelect,
             onMoveEnded: { translation in
