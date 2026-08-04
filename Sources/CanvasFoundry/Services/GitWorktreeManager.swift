@@ -148,6 +148,17 @@ struct GitWorktreeManager: Sendable {
             // Keeps the in-repo copies out of `git status` before the first
             // worktree ever lands.
             try await ensureContainerExcluded(projectRoot: projectRoot)
+            // Best-effort: without it the editor's Source Control panel cannot
+            // see repositories three levels down, but a failure to write editor
+            // config must never block creating the worktree itself.
+            do {
+                try EditorSettingsWriter.ensureRepositoryScanDepth(projectRoot: projectRoot)
+            } catch {
+                NSLog(
+                    "Canvas Foundry could not update .vscode/settings.json: %@",
+                    error.localizedDescription
+                )
+            }
         }
 
         // Named after the agent rather than a hash, so the folder is recognisable

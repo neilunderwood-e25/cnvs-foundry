@@ -953,8 +953,10 @@ final class CanvasFoundryTests: XCTestCase {
             "folders should carry the agent name, not a hash"
         )
 
-        // In-repo copies are only safe if `.git/info/exclude` hides them:
-        // the project's own status must stay clean.
+        // In-repo copies are only safe if `.git/info/exclude` hides them: the
+        // worktrees themselves must never appear in the project's status. The
+        // one visible addition is `.vscode/` — the editor scan-depth setting is
+        // deliberately committable, unlike the worktrees.
         let excludeContents = try String(
             contentsOf: repository.appendingPathComponent(".git/info/exclude"),
             encoding: .utf8
@@ -965,7 +967,15 @@ final class CanvasFoundryTests: XCTestCase {
             arguments: ["status", "--porcelain=v1"],
             currentDirectoryURL: repository
         )
-        XCTAssertEqual(status.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines), "")
+        XCTAssertEqual(
+            status.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines),
+            "?? .vscode/",
+            "worktrees must stay invisible; the editor settings file is the only new entry"
+        )
+        let editorSettings = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: repository.appendingPathComponent(".vscode/settings.json"))
+        ) as? [String: Any]
+        XCTAssertEqual(editorSettings?["git.repositoryScanMaxDepth"] as? Int, 3)
 
         // The rule must not be duplicated by the next agent.
         let second0 = try await manager.createWorktree(
@@ -1007,6 +1017,46 @@ final class CanvasFoundryTests: XCTestCase {
             arguments: ["worktree", "remove", "--force", second.worktreeURL.path],
             currentDirectoryURL: repository
         )
+    }
+
+    func testEditorSettingsGainScanDepthWithoutClobberingExistingConfig() throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CanvasFoundryVSCode-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        let settingsURL = scratch.appendingPathComponent(".vscode/settings.json")
+
+        // Created from nothing.
+        XCTAssertTrue(try EditorSettingsWriter.ensureRepositoryScanDepth(projectRoot: scratch))
+        var settings = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: settingsURL)
+        ) as? [String: Any]
+        XCTAssertEqual(settings?["git.repositoryScanMaxDepth"] as? Int, 3)
+
+        // Merged into existing config without losing other keys.
+        try Data(
+            """
+            {"editor.formatOnSave": true, "git.repositoryScanMaxDepth": 1}
+            """.utf8
+        ).write(to: settingsURL)
+        XCTAssertTrue(try EditorSettingsWriter.ensureRepositoryScanDepth(projectRoot: scratch))
+        settings = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: settingsURL)
+        ) as? [String: Any]
+        XCTAssertEqual(settings?["git.repositoryScanMaxDepth"] as? Int, 3)
+        XCTAssertEqual(settings?["editor.formatOnSave"] as? Bool, true)
+
+        // A deeper or unlimited configuration is never lowered.
+        try Data(#"{"git.repositoryScanMaxDepth": -1}"#.utf8).write(to: settingsURL)
+        XCTAssertFalse(try EditorSettingsWriter.ensureRepositoryScanDepth(projectRoot: scratch))
+        try Data(#"{"git.repositoryScanMaxDepth": 5}"#.utf8).write(to: settingsURL)
+        XCTAssertFalse(try EditorSettingsWriter.ensureRepositoryScanDepth(projectRoot: scratch))
+
+        // JSONC that JSONSerialization cannot parse is left byte-for-byte alone.
+        let jsonc = "{\n  // hand-written comment\n  \"editor.formatOnSave\": true,\n}"
+        try Data(jsonc.utf8).write(to: settingsURL)
+        XCTAssertFalse(try EditorSettingsWriter.ensureRepositoryScanDepth(projectRoot: scratch))
+        XCTAssertEqual(try String(contentsOf: settingsURL, encoding: .utf8), jsonc)
     }
 
     func testIsInsideComparesPathComponentsNotStringPrefixes() {
