@@ -315,10 +315,25 @@ final class WorkspaceModel: ObservableObject {
         guard let projectURL else { return }
         Task {
             do {
+                ensureEditorSeesWorktrees(projectURL)
                 try await IDEProjectOpener.open(projectURL: projectURL, in: ide)
             } catch {
                 alertState = .message(error.localizedDescription)
             }
+        }
+    }
+
+    /// The editor only discovers in-repo worktrees if its repository scan depth
+    /// reaches them, and it reads that setting at window load. Writing it just
+    /// before launch covers projects whose worktrees predate the setting.
+    private func ensureEditorSeesWorktrees(_ projectRoot: URL) {
+        do {
+            try EditorSettingsWriter.ensureRepositoryScanDepth(projectRoot: projectRoot)
+        } catch {
+            NSLog(
+                "Canvas Foundry could not update .vscode/settings.json: %@",
+                error.localizedDescription
+            )
         }
     }
 
@@ -340,6 +355,7 @@ final class WorkspaceModel: ObservableObject {
 
         Task {
             do {
+                ensureEditorSeesWorktrees(projectURL)
                 guard !externalFolders.isEmpty else {
                     try await IDEProjectOpener.open(projectURL: projectURL, in: ide)
                     return
@@ -371,6 +387,7 @@ final class WorkspaceModel: ObservableObject {
                     descriptor.worktreeURL,
                     of: descriptor.projectRoot
                 ) {
+                    ensureEditorSeesWorktrees(descriptor.projectRoot)
                     try await IDEProjectOpener.open(
                         projectURL: descriptor.projectRoot,
                         in: ide
