@@ -125,7 +125,9 @@ struct WorkspaceView: View {
                     model.preparePullRequest(session)
                 },
                 onOpenPullRequest: { model.openPullRequest(session) },
-                onPushPullRequestUpdates: { model.pushPullRequestUpdates(session) }
+                onPushPullRequestUpdates: { model.pushPullRequestUpdates(session) },
+                onRefreshPullRequest: { model.refreshPullRequest(session) },
+                onArchive: { model.archive(session) }
             )
             // Flexible upper bounds make the sheet resizable; ideal sizes open
             // it large enough to review a real diff without immediately

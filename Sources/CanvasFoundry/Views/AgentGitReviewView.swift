@@ -7,15 +7,16 @@ struct AgentGitReviewView: View {
     let onPreparePullRequest: () -> Void
     let onOpenPullRequest: () -> Void
     let onPushPullRequestUpdates: () -> Void
+    /// Re-reads the PR from GitHub so a merge done in the browser shows here.
+    let onRefreshPullRequest: () -> Void
+    let onArchive: () -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var snapshot: GitReviewSnapshot?
     @State private var isLoading = false
-    @State private var isIntegrating = false
     @State private var errorMessage: String?
     @State private var actionMessage: String?
     @State private var testOutput = ""
-    @State private var pendingAction: PendingGitAction?
     @State private var commitMessage = ""
     @State private var isCommitting = false
     @State private var isStaging = false
@@ -43,30 +44,14 @@ struct AgentGitReviewView: View {
         }
         .background(Color(red: 0.045, green: 0.05, blue: 0.065))
         .task(id: session.id) {
+            // A PR merged in the browser only shows here if we ask GitHub again.
+            onRefreshPullRequest()
             await loadReview()
         }
-        .alert(item: $pendingAction) { action in
-            switch action {
-            case .merge:
-                Alert(
-                    title: Text("Merge \(session.name)'s branch?"),
-                    message: Text("Canvas Foundry will merge \(session.worktree?.branchName ?? "the agent branch") into the currently checked-out project branch. The main checkout must be clean."),
-                    primaryButton: .default(Text("Merge Branch")) {
-                        integrate(.merge)
-                    },
-                    secondaryButton: .cancel()
-                )
-            case .cherryPick(let commit):
-                Alert(
-                    title: Text("Cherry-pick \(commit.shortHash)?"),
-                    message: Text(commit.subject),
-                    primaryButton: .default(Text("Cherry-pick")) {
-                        integrate(.cherryPick(commit))
-                    },
-                    secondaryButton: .cancel()
-                )
-            }
-        }
+    }
+
+    private var isPullRequestMerged: Bool {
+        session.pullRequest?.state == .merged
     }
 
     private var header: some View {
@@ -93,12 +78,13 @@ struct AgentGitReviewView: View {
             .disabled(session.testStatus == .running || session.worktree == nil)
 
             Button {
+                onRefreshPullRequest()
                 Task { await loadReview() }
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
             .disabled(isLoading)
-            .help("Refresh review")
+            .help("Refresh review and pull request state")
 
             Button("Done") { dismiss() }
                 .keyboardShortcut(.cancelAction)
@@ -114,6 +100,11 @@ struct AgentGitReviewView: View {
                 .controlSize(.small)
                 .help("Updating pull request")
         } else if let pullRequest = session.pullRequest {
+            if isPullRequestMerged {
+                Label("Merged", systemImage: "checkmark.seal.fill")
+                    .font(.foundry(size: 11, weight: .semibold))
+                    .foregroundStyle(.purple)
+            }
             Button("Open \(pullRequest.displayLabel)", action: onOpenPullRequest)
             if pullRequest.state == .open {
                 Button("Push Updates", action: onPushPullRequestUpdates)
@@ -139,12 +130,13 @@ struct AgentGitReviewView: View {
             HSplitView {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
-                        reviewStats(snapshot)
-                        workingChangesSection(snapshot)
-                        commitComposerSection(snapshot)
-                        committedFilesSection(snapshot)
-                        commitsSection(snapshot.commits)
-                        integrationSection(snapshot)
+                        if isPullRequestMerged {
+                            mergedSection
+                        } else {
+                            workingChangesSection(snapshot)
+                            commitComposerSection(snapshot)
+                        }
+                        branchSection(snapshot)
                         if !testOutput.isEmpty {
                             testOutputSection
                         }
@@ -189,25 +181,35 @@ struct AgentGitReviewView: View {
         }
     }
 
-    private func reviewStats(_ snapshot: GitReviewSnapshot) -> some View {
-        HStack(spacing: 10) {
-            stat("\(snapshot.files.count)", label: "files", color: .orange)
-            stat("\(snapshot.commits.count)", label: "commits", color: .cyan)
-        }
-    }
+    /// Shown once the PR is merged: this sheet's work is done, so the only
+    /// sensible action left is tidying up the agent.
+    private var mergedSection: some View {
+        reviewSection("MERGED") {
+            VStack(alignment: .leading, spacing: 10) {
+                Label(
+                    "\(session.pullRequest?.displayLabel ?? "The pull request") was merged. This branch is integrated.",
+                    systemImage: "checkmark.seal.fill"
+                )
+                .font(.foundry(size: 11.5))
+                .foregroundStyle(.purple)
 
-    private func stat(_ value: String, label: String, color: Color) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(value)
-                .font(.foundry(size: 20, weight: .bold))
-                .foregroundStyle(color)
-            Text(label)
-                .font(.foundry(size: 11))
-                .foregroundStyle(.secondary)
+                Button {
+                    dismiss()
+                    onArchive()
+                } label: {
+                    Label("Archive Agent", systemImage: "archivebox")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.purple)
+
+                Text("Archiving keeps the card in the sidebar. Deleting the worktree is available from the agent's menu.")
+                    .font(.foundry(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .background(.purple.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
     }
 
     // MARK: - Working changes (stage / unstage)
@@ -369,93 +371,67 @@ struct AgentGitReviewView: View {
         }
     }
 
-    // MARK: - Committed files
+    // MARK: - Committed work
 
-    private func committedFilesSection(_ snapshot: GitReviewSnapshot) -> some View {
+    /// Everything already on the branch: the commits, then the files they
+    /// touch. One section instead of three — commits are what a PR is made of,
+    /// and the files are clickable for their diffs.
+    private func branchSection(_ snapshot: GitReviewSnapshot) -> some View {
         let workingPaths = Set(snapshot.workingFiles.map(\.path))
         let committed = snapshot.files.filter { !workingPaths.contains($0.path) }
-        return reviewSection("COMMITTED FILES") {
-            if committed.isEmpty {
-                Text("Nothing committed beyond the base revision yet.")
+        return reviewSection(
+            "ON THIS BRANCH · \(snapshot.commits.count) COMMIT\(snapshot.commits.count == 1 ? "" : "S")"
+        ) {
+            if snapshot.commits.isEmpty {
+                Text("No commits yet — stage and commit above, then publish the draft PR.")
                     .font(.foundry(size: 11))
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(committed) { file in
-                    Button {
-                        focus(
-                            on: GitWorkingFile(
-                                indexStatus: " ",
-                                worktreeStatus: " ",
-                                path: file.path
-                            )
-                        )
-                    } label: {
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Image(systemName: "checkmark.circle")
-                                .font(.system(size: 9))
-                                .foregroundStyle(.cyan)
-                            Text(file.path)
-                                .font(.system(size: 11, design: .monospaced))
-                                .lineLimit(2)
-                                .foregroundStyle(
-                                    selectedFile?.path == file.path
-                                        ? Color.accentColor
-                                        : .primary
-                                )
-                            Spacer(minLength: 0)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Show this file's diff")
-                }
-            }
-        }
-    }
-
-    private func commitsSection(_ commits: [GitCommitSummary]) -> some View {
-        reviewSection("AGENT COMMITS") {
-            if commits.isEmpty {
-                Text("No commits beyond the agent's base revision")
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(commits) { commit in
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack {
-                            Text(commit.shortHash)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.cyan)
-                            Spacer()
-                            Button("Cherry-pick") {
-                                pendingAction = .cherryPick(commit)
-                            }
-                            .buttonStyle(.borderless)
-                            .disabled(isIntegrating)
-                        }
+                ForEach(snapshot.commits) { commit in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(commit.shortHash)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.cyan)
                         Text(commit.subject)
                             .font(.foundry(size: 11))
+                            .lineLimit(2)
+                        Spacer(minLength: 0)
                     }
-                    .padding(.vertical, 3)
+                }
+
+                if !committed.isEmpty {
+                    Divider().opacity(0.35)
+                    ForEach(committed) { file in
+                        Button {
+                            focus(
+                                on: GitWorkingFile(
+                                    indexStatus: " ",
+                                    worktreeStatus: " ",
+                                    path: file.path
+                                )
+                            )
+                        } label: {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Image(systemName: "checkmark.circle")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.cyan)
+                                Text(file.path)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .lineLimit(2)
+                                    .foregroundStyle(
+                                        selectedFile?.path == file.path
+                                            ? Color.accentColor
+                                            : .primary
+                                    )
+                                Spacer(minLength: 0)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Show this file's diff")
+                    }
                 }
             }
-        }
-    }
-
-    private func integrationSection(_ snapshot: GitReviewSnapshot) -> some View {
-        reviewSection("INTEGRATE") {
-            Button {
-                pendingAction = .merge
-            } label: {
-                Label("Merge Agent Branch", systemImage: "arrow.triangle.merge")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.orange)
-            .disabled(snapshot.commits.isEmpty || isIntegrating)
-
-            Text("Only committed work can be merged or cherry-picked. Uncommitted files stay in the agent worktree.")
-                .font(.foundry(size: 10))
-                .foregroundStyle(.secondary)
         }
     }
 
@@ -647,39 +623,4 @@ struct AgentGitReviewView: View {
         }
     }
 
-    private func integrate(_ action: PendingGitAction) {
-        guard let descriptor = session.worktree else { return }
-        isIntegrating = true
-        errorMessage = nil
-        actionMessage = nil
-        Task {
-            defer { isIntegrating = false }
-            do {
-                switch action {
-                case .merge:
-                    try await service.mergeAgentBranch(descriptor)
-                    actionMessage = "Merged \(descriptor.branchName) into the main project checkout."
-                case .cherryPick(let commit):
-                    try await service.cherryPick(commit, from: descriptor)
-                    actionMessage = "Cherry-picked \(commit.shortHash) into the main project checkout."
-                }
-                onRepositoryChanged()
-                await loadReview()
-            } catch {
-                errorMessage = error.localizedDescription
-            }
-        }
-    }
-}
-
-private enum PendingGitAction: Identifiable {
-    case merge
-    case cherryPick(GitCommitSummary)
-
-    var id: String {
-        switch self {
-        case .merge: "merge"
-        case .cherryPick(let commit): "cherry-\(commit.hash)"
-        }
-    }
 }
