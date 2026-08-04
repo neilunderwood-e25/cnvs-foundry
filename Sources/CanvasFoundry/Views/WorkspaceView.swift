@@ -4,6 +4,7 @@ import SwiftUI
 struct WorkspaceView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = WorkspaceModel()
+    @State private var isReviewQueuePresented = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -112,6 +113,9 @@ struct WorkspaceView: View {
             )
             .frame(minWidth: 940, minHeight: 680)
         }
+        .sheet(isPresented: $isReviewQueuePresented) {
+            PullRequestReviewQueueView(model: model)
+        }
     }
 
     private func pullRequestConfirmationMessage(
@@ -156,6 +160,18 @@ struct WorkspaceView: View {
 
             if model.projectURL != nil {
                 IDELaunchButtons(model: model)
+                Button {
+                    isReviewQueuePresented = true
+                } label: {
+                    Label(
+                        model.openPullRequestCount == 0
+                            ? "Review Queue"
+                            : "Review Queue (\(model.openPullRequestCount))",
+                        systemImage: "arrow.triangle.pull"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
 
             Spacer()

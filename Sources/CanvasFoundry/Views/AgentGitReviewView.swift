@@ -107,7 +107,7 @@ struct AgentGitReviewView: View {
         if session.isPublishingPullRequest {
             ProgressView()
                 .controlSize(.small)
-                .help("Publishing pull request")
+                .help("Updating pull request")
         } else if let pullRequest = session.pullRequest {
             Button("Open \(pullRequest.displayLabel)", action: onOpenPullRequest)
             if pullRequest.state == .open {

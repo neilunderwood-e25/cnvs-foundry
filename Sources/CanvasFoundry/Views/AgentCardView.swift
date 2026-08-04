@@ -73,7 +73,7 @@ struct AgentCardView: View {
                         onReview()
                     }
                     if session.isPublishingPullRequest {
-                        Button("Publishing Pull Request…") {}
+                        Button("Updating Pull Request…") {}
                             .disabled(true)
                     } else if let pullRequest = session.pullRequest {
                         Button("Open \(pullRequest.displayLabel)", action: onOpenPullRequest)
@@ -167,11 +167,11 @@ struct AgentCardView: View {
             Spacer()
             if let pullRequest = session.pullRequest {
                 Button(action: onOpenPullRequest) {
-                    Text(pullRequest.displayLabel)
+                    Text(pullRequest.queueState.label.uppercased())
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(pullRequest.state == .open ? .cyan : .secondary)
+                .foregroundStyle(pullRequestBadgeColor(pullRequest.queueState))
                 .help("Open pull request")
             }
             if session.gitSummary.changedFileCount > 0 {
@@ -208,6 +208,15 @@ struct AgentCardView: View {
         .padding(.horizontal, 12)
         .padding(.trailing, 14)
         .frame(height: 30)
+    }
+
+    private func pullRequestBadgeColor(_ state: PullRequestQueueState) -> Color {
+        switch state {
+        case .readyToMerge, .merged: .green
+        case .checksFailed, .changesRequested, .conflict: .red
+        case .draft, .checksPending, .reviewRequired, .behind: .orange
+        case .blocked, .closed: .secondary
+        }
     }
 
     private var statusBadge: some View {

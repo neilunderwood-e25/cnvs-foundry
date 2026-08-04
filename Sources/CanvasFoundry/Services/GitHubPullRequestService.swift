@@ -15,6 +15,8 @@ enum GitHubPullRequestError: LocalizedError {
     case unsupportedRemote(String)
     case noAgentCommits
     case pullRequestNotFound
+    case worktreeHasChanges
+    case pullRequestNotReady(String)
     case commandFailed(String)
 
     var errorDescription: String? {
@@ -31,6 +33,10 @@ enum GitHubPullRequestError: LocalizedError {
             "Commit the agent’s work before publishing a pull request. Uncommitted files cannot be included in a PR."
         case .pullRequestNotFound:
             "No pull request was found for this agent branch."
+        case .worktreeHasChanges:
+            "Commit or stash the agent’s uncommitted changes before syncing its branch with the base branch."
+        case .pullRequestNotReady(let reason):
+            "This pull request is not ready to merge: \(reason)."
         case .commandFailed(let message):
             message
         }
@@ -77,7 +83,6 @@ struct GitHubPullRequestService: Sendable {
         )
         let existing = try await findPullRequest(
             branchName: descriptor.branchName,
-            host: context.host,
             in: descriptor.worktreeURL
         )
         return PullRequestPreflight(
@@ -100,7 +105,7 @@ struct GitHubPullRequestService: Sendable {
         if let existing = preflight.existingPullRequest {
             return existing
         }
-        let context = try await githubContext(descriptor)
+        _ = try await githubContext(descriptor)
         try await pushBranch(descriptor)
 
         let body = Self.pullRequestBody(
@@ -123,7 +128,6 @@ struct GitHubPullRequestService: Sendable {
         if createResult.exitCode != 0,
            let existing = try await findPullRequest(
                branchName: descriptor.branchName,
-               host: context.host,
                in: descriptor.worktreeURL
            ) {
             return existing
@@ -133,7 +137,6 @@ struct GitHubPullRequestService: Sendable {
         }
         guard let created = try await findPullRequest(
             branchName: descriptor.branchName,
-            host: context.host,
             in: descriptor.worktreeURL
         ) else {
             throw GitHubPullRequestError.pullRequestNotFound
@@ -142,11 +145,10 @@ struct GitHubPullRequestService: Sendable {
     }
 
     func pushUpdates(_ descriptor: WorktreeDescriptor) async throws -> AgentPullRequest {
-        let context = try await githubContext(descriptor)
+        _ = try await githubContext(descriptor)
         try await pushBranch(descriptor)
         guard let pullRequest = try await findPullRequest(
             branchName: descriptor.branchName,
-            host: context.host,
             in: descriptor.worktreeURL
         ) else {
             throw GitHubPullRequestError.pullRequestNotFound
@@ -155,15 +157,105 @@ struct GitHubPullRequestService: Sendable {
     }
 
     func refresh(_ descriptor: WorktreeDescriptor) async throws -> AgentPullRequest {
-        let context = try await githubContext(descriptor)
+        _ = try await githubContext(descriptor)
         guard let pullRequest = try await findPullRequest(
             branchName: descriptor.branchName,
-            host: context.host,
+            in: commandDirectory(for: descriptor)
+        ) else {
+            throw GitHubPullRequestError.pullRequestNotFound
+        }
+        return pullRequest
+    }
+
+    func markReady(_ descriptor: WorktreeDescriptor) async throws -> AgentPullRequest {
+        _ = try await githubContext(descriptor)
+        let pullRequest = try await requirePullRequest(descriptor)
+        let result = try await runGitHub(
+            ["pr", "ready", String(pullRequest.number)],
+            in: descriptor.worktreeURL,
+            requireSuccess: false
+        )
+        guard result.exitCode == 0 else {
+            throw GitHubPullRequestError.commandFailed(Self.commandDetails(result))
+        }
+        return try await requirePullRequest(descriptor)
+    }
+
+    func syncWithBase(_ descriptor: WorktreeDescriptor) async throws -> AgentPullRequest {
+        _ = try await githubContext(descriptor)
+        let status = try await runGit(
+            ["status", "--porcelain=v1"],
+            in: descriptor.worktreeURL
+        )
+        guard status.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw GitHubPullRequestError.worktreeHasChanges
+        }
+
+        try await pushBranch(descriptor)
+        let pullRequest = try await requirePullRequest(descriptor)
+        let updateResult = try await runGitHub(
+            ["pr", "update-branch", String(pullRequest.number)],
+            in: descriptor.worktreeURL,
+            requireSuccess: false
+        )
+        guard updateResult.exitCode == 0 else {
+            throw GitHubPullRequestError.commandFailed(Self.commandDetails(updateResult))
+        }
+
+        _ = try await runGit(
+            ["fetch", "origin", descriptor.branchName],
+            in: descriptor.worktreeURL
+        )
+        _ = try await runGit(
+            ["merge", "--ff-only", "FETCH_HEAD"],
+            in: descriptor.worktreeURL
+        )
+        return try await requirePullRequest(descriptor)
+    }
+
+    func squashMerge(_ descriptor: WorktreeDescriptor) async throws -> AgentPullRequest {
+        _ = try await githubContext(descriptor)
+        let pullRequest = try await requirePullRequest(descriptor)
+        guard pullRequest.isReadyToMerge else {
+            throw GitHubPullRequestError.pullRequestNotReady(
+                pullRequest.queueState.label.lowercased()
+            )
+        }
+        guard let headCommitOID = pullRequest.headCommitOID, !headCommitOID.isEmpty else {
+            throw GitHubPullRequestError.pullRequestNotReady("head commit is unavailable")
+        }
+
+        let result = try await runGitHub(
+            [
+                "pr", "merge", String(pullRequest.number),
+                "--squash",
+                "--match-head-commit", headCommitOID
+            ],
+            in: descriptor.worktreeURL,
+            requireSuccess: false
+        )
+        guard result.exitCode == 0 else {
+            throw GitHubPullRequestError.commandFailed(Self.commandDetails(result))
+        }
+        return try await requirePullRequest(descriptor)
+    }
+
+    private func requirePullRequest(
+        _ descriptor: WorktreeDescriptor
+    ) async throws -> AgentPullRequest {
+        guard let pullRequest = try await findPullRequest(
+            branchName: descriptor.branchName,
             in: descriptor.worktreeURL
         ) else {
             throw GitHubPullRequestError.pullRequestNotFound
         }
         return pullRequest
+    }
+
+    private func commandDirectory(for descriptor: WorktreeDescriptor) -> URL {
+        FileManager.default.fileExists(atPath: descriptor.worktreeURL.path)
+            ? descriptor.worktreeURL
+            : descriptor.projectRoot
     }
 
     private func githubContext(_ descriptor: WorktreeDescriptor) async throws -> GitHubContext {
@@ -239,27 +331,61 @@ struct GitHubPullRequestService: Sendable {
 
     private func findPullRequest(
         branchName: String,
-        host: String,
         in directory: URL
     ) async throws -> AgentPullRequest? {
         let result = try await runGitHub(
             [
                 "pr", "view", branchName,
-                "--json", "number,url,state,isDraft,headRefName,baseRefName"
+                "--json", [
+                    "number", "url", "state", "isDraft", "headRefName", "baseRefName",
+                    "title", "mergeable", "mergeStateStatus", "reviewDecision", "headRefOid",
+                    "changedFiles", "additions", "deletions"
+                ].joined(separator: ",")
             ],
             in: directory,
             requireSuccess: false
         )
         guard result.exitCode == 0 else { return nil }
+        let response: GitHubPullRequestResponse
         do {
-            let response = try JSONDecoder().decode(
+            response = try JSONDecoder().decode(
                 GitHubPullRequestResponse.self,
                 from: Data(result.standardOutput.utf8)
             )
-            return response.pullRequest
         } catch {
             throw GitHubPullRequestError.commandFailed(
                 "GitHub CLI returned an unreadable pull request response."
+            )
+        }
+        let checks = try await pullRequestChecks(
+            branchName: branchName,
+            in: directory
+        )
+        return response.pullRequest(checks: checks)
+    }
+
+    private func pullRequestChecks(
+        branchName: String,
+        in directory: URL
+    ) async throws -> [PullRequestCheck] {
+        let result = try await runGitHub(
+            [
+                "pr", "checks", branchName,
+                "--json", "name,workflow,state,bucket,link"
+            ],
+            in: directory,
+            requireSuccess: false
+        )
+        let output = result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !output.isEmpty else { return [] }
+        do {
+            return try JSONDecoder().decode(
+                [GitHubCheckResponse].self,
+                from: Data(output.utf8)
+            ).map(\.check)
+        } catch {
+            throw GitHubPullRequestError.commandFailed(
+                "GitHub CLI returned an unreadable checks response."
             )
         }
     }
@@ -355,8 +481,16 @@ private struct GitHubPullRequestResponse: Decodable {
     let isDraft: Bool
     let headRefName: String
     let baseRefName: String
+    let title: String?
+    let mergeable: String?
+    let mergeStateStatus: String?
+    let reviewDecision: String?
+    let headRefOid: String?
+    let changedFiles: Int?
+    let additions: Int?
+    let deletions: Int?
 
-    var pullRequest: AgentPullRequest {
+    func pullRequest(checks: [PullRequestCheck]) -> AgentPullRequest {
         AgentPullRequest(
             number: number,
             url: url,
@@ -364,7 +498,59 @@ private struct GitHubPullRequestResponse: Decodable {
             isDraft: isDraft,
             headBranch: headRefName,
             baseBranch: baseRefName,
-            updatedAt: Date()
+            updatedAt: Date(),
+            title: title ?? "",
+            mergeability: PullRequestMergeability(
+                rawValue: mergeable?.lowercased() ?? ""
+            ) ?? .unknown,
+            mergeStateStatus: mergeStateStatus?.uppercased() ?? "UNKNOWN",
+            checksStatus: Self.checksStatus(checks),
+            reviewDecision: Self.reviewDecision(reviewDecision),
+            headCommitOID: headRefOid,
+            changedFiles: changedFiles ?? 0,
+            additions: additions ?? 0,
+            deletions: deletions ?? 0,
+            checks: checks
+        )
+    }
+
+    private static func checksStatus(
+        _ checks: [PullRequestCheck]
+    ) -> PullRequestChecksStatus {
+        guard !checks.isEmpty else { return .noChecks }
+        if checks.contains(where: { ["fail", "cancel"].contains($0.bucket.lowercased()) }) {
+            return .failed
+        }
+        if checks.contains(where: { $0.bucket.lowercased() == "pending" }) {
+            return .pending
+        }
+        return .passed
+    }
+
+    private static func reviewDecision(_ value: String?) -> PullRequestReviewDecision {
+        switch value?.uppercased() {
+        case "APPROVED": .approved
+        case "CHANGES_REQUESTED": .changesRequested
+        case "REVIEW_REQUIRED": .reviewRequired
+        default: .none
+        }
+    }
+}
+
+private struct GitHubCheckResponse: Decodable {
+    let name: String
+    let workflow: String?
+    let state: String
+    let bucket: String
+    let link: URL?
+
+    var check: PullRequestCheck {
+        PullRequestCheck(
+            name: name,
+            workflow: workflow,
+            state: state,
+            bucket: bucket,
+            link: link
         )
     }
 }

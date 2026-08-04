@@ -172,7 +172,25 @@ final class CanvasFoundryTests: XCTestCase {
             isDraft: true,
             headBranch: "canvas/grace-codex-12345678",
             baseBranch: "main",
-            updatedAt: pullRequestDate
+            updatedAt: pullRequestDate,
+            title: "Add persisted PR state",
+            mergeability: .mergeable,
+            mergeStateStatus: "CLEAN",
+            checksStatus: .passed,
+            reviewDecision: .approved,
+            headCommitOID: "abc123",
+            changedFiles: 3,
+            additions: 45,
+            deletions: 7,
+            checks: [
+                PullRequestCheck(
+                    name: "tests",
+                    workflow: "CI",
+                    state: "SUCCESS",
+                    bucket: "pass",
+                    link: URL(string: "https://github.com/example/project/actions/1")
+                )
+            ]
         )
         sourceModel.sessions = [sourceSession]
         sourceModel.select(sourceSession)
@@ -197,6 +215,12 @@ final class CanvasFoundryTests: XCTestCase {
         XCTAssertEqual(restored.pullRequest?.state, .open)
         XCTAssertEqual(restored.pullRequest?.isDraft, true)
         XCTAssertEqual(restored.pullRequest?.updatedAt, pullRequestDate)
+        XCTAssertEqual(restored.pullRequest?.title, "Add persisted PR state")
+        XCTAssertEqual(restored.pullRequest?.mergeability, .mergeable)
+        XCTAssertEqual(restored.pullRequest?.checksStatus, .passed)
+        XCTAssertEqual(restored.pullRequest?.reviewDecision, .approved)
+        XCTAssertEqual(restored.pullRequest?.headCommitOID, "abc123")
+        XCTAssertEqual(restored.pullRequest?.checks.first?.name, "tests")
         XCTAssertEqual(restored.status, .stopped)
         XCTAssertTrue(restored.isSelected)
         XCTAssertNil(restored.runtime)
@@ -545,6 +569,142 @@ final class CanvasFoundryTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("brew install gh"))
             XCTAssertTrue(error.localizedDescription.contains("gh auth login"))
         }
+    }
+
+    func testReviewQueueReadySyncAndSquashMergeWorkflow() async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CanvasFoundryMergeQueue-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let project = scratch.appendingPathComponent("project", isDirectory: true)
+        let worktree = scratch.appendingPathComponent("worktree", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: worktree, withIntermediateDirectories: true)
+
+        let draftMarker = scratch.appendingPathComponent("draft")
+        let mergedMarker = scratch.appendingPathComponent("merged")
+        let gitLog = scratch.appendingPathComponent("git.log")
+        let ghLog = scratch.appendingPathComponent("gh.log")
+        let fakeGit = scratch.appendingPathComponent("git")
+        let fakeGitHub = scratch.appendingPathComponent("gh")
+        try Data().write(to: draftMarker)
+
+        let gitScript = """
+        #!/bin/sh
+        printf '%s\n' "$*" >> "\(gitLog.path)"
+        if [ "$1" = "remote" ]; then
+          echo 'git@github.com:example/project.git'
+        fi
+        exit 0
+        """
+        let ghScript = """
+        #!/bin/sh
+        printf '%s\n' "$*" >> "\(ghLog.path)"
+        if [ "$1" = "auth" ]; then
+          exit 0
+        elif [ "$1" = "repo" ]; then
+          echo '{"defaultBranchRef":{"name":"main"}}'
+          exit 0
+        elif [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
+          echo '[{"name":"tests","workflow":"CI","state":"SUCCESS","bucket":"pass","link":"https://github.com/example/project/actions/1"}]'
+          exit 0
+        elif [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+          if [ -f "\(mergedMarker.path)" ]; then
+            echo '{"number":31,"url":"https://github.com/example/project/pull/31","state":"MERGED","isDraft":false,"headRefName":"canvas/grace-codex-12345678","baseRefName":"main","title":"Ship the queue","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","reviewDecision":"","headRefOid":"abc123","changedFiles":4,"additions":80,"deletions":12}'
+          elif [ -f "\(draftMarker.path)" ]; then
+            echo '{"number":31,"url":"https://github.com/example/project/pull/31","state":"OPEN","isDraft":true,"headRefName":"canvas/grace-codex-12345678","baseRefName":"main","title":"Ship the queue","mergeable":"MERGEABLE","mergeStateStatus":"DRAFT","reviewDecision":"","headRefOid":"abc123","changedFiles":4,"additions":80,"deletions":12}'
+          else
+            echo '{"number":31,"url":"https://github.com/example/project/pull/31","state":"OPEN","isDraft":false,"headRefName":"canvas/grace-codex-12345678","baseRefName":"main","title":"Ship the queue","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":"","headRefOid":"abc123","changedFiles":4,"additions":80,"deletions":12}'
+          fi
+          exit 0
+        elif [ "$1" = "pr" ] && [ "$2" = "ready" ]; then
+          rm "\(draftMarker.path)"
+          exit 0
+        elif [ "$1" = "pr" ] && [ "$2" = "update-branch" ]; then
+          exit 0
+        elif [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+          touch "\(mergedMarker.path)"
+          exit 0
+        fi
+        exit 1
+        """
+        try Data(gitScript.utf8).write(to: fakeGit)
+        try Data(ghScript.utf8).write(to: fakeGitHub)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeGit.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeGitHub.path)
+
+        let descriptor = WorktreeDescriptor(
+            projectRoot: project,
+            worktreeURL: worktree,
+            branchName: "canvas/grace-codex-12345678",
+            baseRevision: "base123"
+        )
+        let service = GitHubPullRequestService(gitURL: fakeGit, ghURL: fakeGitHub)
+
+        let draft = try await service.refresh(descriptor)
+        XCTAssertEqual(draft.queueState, .draft)
+        XCTAssertEqual(draft.checksStatus, .passed)
+        XCTAssertEqual(draft.changedFiles, 4)
+
+        let ready = try await service.markReady(descriptor)
+        XCTAssertEqual(ready.queueState, .readyToMerge)
+        XCTAssertEqual(ready.headCommitOID, "abc123")
+
+        let synced = try await service.syncWithBase(descriptor)
+        XCTAssertEqual(synced.queueState, .readyToMerge)
+
+        let merged = try await service.squashMerge(descriptor)
+        XCTAssertEqual(merged.state, .merged)
+        XCTAssertEqual(merged.queueState, .merged)
+
+        let recordedGitCommands = try String(contentsOf: gitLog, encoding: .utf8)
+        XCTAssertTrue(recordedGitCommands.contains("push --set-upstream origin canvas/grace-codex-12345678"))
+        XCTAssertTrue(recordedGitCommands.contains("fetch origin canvas/grace-codex-12345678"))
+        XCTAssertTrue(recordedGitCommands.contains("merge --ff-only FETCH_HEAD"))
+
+        let recordedGitHubCommands = try String(contentsOf: ghLog, encoding: .utf8)
+        XCTAssertTrue(recordedGitHubCommands.contains("pr ready 31"))
+        XCTAssertTrue(recordedGitHubCommands.contains("pr update-branch 31"))
+        XCTAssertTrue(recordedGitHubCommands.contains("pr merge 31 --squash --match-head-commit abc123"))
+    }
+
+    func testReviewQueueStatePrioritizesConflictsChecksAndReviews() {
+        func pullRequest(
+            draft: Bool = false,
+            mergeability: PullRequestMergeability = .mergeable,
+            mergeState: String = "CLEAN",
+            checks: PullRequestChecksStatus = .passed,
+            review: PullRequestReviewDecision = .none
+        ) -> AgentPullRequest {
+            AgentPullRequest(
+                number: 1,
+                url: URL(string: "https://github.com/example/project/pull/1")!,
+                state: .open,
+                isDraft: draft,
+                headBranch: "canvas/test",
+                baseBranch: "main",
+                updatedAt: Date(),
+                mergeability: mergeability,
+                mergeStateStatus: mergeState,
+                checksStatus: checks,
+                reviewDecision: review,
+                headCommitOID: "abc123"
+            )
+        }
+
+        XCTAssertEqual(pullRequest(draft: true).queueState, .draft)
+        XCTAssertEqual(
+            pullRequest(mergeability: .conflicting, mergeState: "DIRTY").queueState,
+            .conflict
+        )
+        XCTAssertEqual(pullRequest(checks: .failed).queueState, .checksFailed)
+        XCTAssertEqual(pullRequest(checks: .pending).queueState, .checksPending)
+        XCTAssertEqual(
+            pullRequest(review: .changesRequested).queueState,
+            .changesRequested
+        )
+        XCTAssertEqual(pullRequest(review: .reviewRequired).queueState, .reviewRequired)
+        XCTAssertEqual(pullRequest(mergeState: "BEHIND").queueState, .behind)
+        XCTAssertEqual(pullRequest().queueState, .readyToMerge)
     }
 
     func testEmptyFolderCanBeInitializedForAgentWorktrees() async throws {

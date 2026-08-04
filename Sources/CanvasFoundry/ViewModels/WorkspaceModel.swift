@@ -110,6 +110,8 @@ final class WorkspaceModel: ObservableObject {
     }
     @Published var alertState: WorkspaceAlertState?
     @Published var reviewingSession: AgentSession?
+    @Published var reviewQueueNotice: String?
+    @Published private(set) var mergingSessionID: UUID?
 
     private let worktreeManager: GitWorktreeManager
     private let projectManager: GitProjectManager
@@ -151,6 +153,21 @@ final class WorkspaceModel: ObservableObject {
             guard let path = session.worktree?.worktreeURL.path else { return false }
             return FileManager.default.fileExists(atPath: path)
         }
+    }
+
+    var reviewQueueSessions: [AgentSession] {
+        sessions
+            .filter { $0.pullRequest != nil }
+            .sorted { lhs, rhs in
+                let lhsOpen = lhs.pullRequest?.state == .open
+                let rhsOpen = rhs.pullRequest?.state == .open
+                if lhsOpen != rhsOpen { return lhsOpen }
+                return lhs.createdAt < rhs.createdAt
+            }
+    }
+
+    var openPullRequestCount: Int {
+        sessions.filter { $0.pullRequest?.state == .open }.count
     }
 
     func chooseProject() {
@@ -388,15 +405,104 @@ final class WorkspaceModel: ObservableObject {
                 session.pullRequest = try await pullRequestService.refresh(descriptor)
             } catch {
                 if reportErrors {
-                    alertState = .message(error.localizedDescription)
+                    reviewQueueNotice = error.localizedDescription
                 }
             }
         }
     }
 
     func refreshAllPullRequests() {
-        for session in sessions where !session.isArchived && session.pullRequest != nil {
+        for session in sessions where session.pullRequest != nil {
             refreshPullRequest(session)
+        }
+    }
+
+    func markPullRequestReady(_ session: AgentSession) {
+        guard let descriptor = session.worktree,
+              !session.isPublishingPullRequest else {
+            return
+        }
+        reviewQueueNotice = nil
+        session.isPublishingPullRequest = true
+        Task {
+            defer { session.isPublishingPullRequest = false }
+            do {
+                session.pullRequest = try await pullRequestService.markReady(descriptor)
+                reviewQueueNotice = "PR #\(session.pullRequest?.number ?? 0) is ready for review."
+            } catch {
+                reviewQueueNotice = error.localizedDescription
+            }
+        }
+    }
+
+    func syncPullRequestWithBase(_ session: AgentSession) {
+        guard let descriptor = session.worktree,
+              !session.isPublishingPullRequest else {
+            return
+        }
+        reviewQueueNotice = nil
+        session.isPublishingPullRequest = true
+        Task {
+            defer { session.isPublishingPullRequest = false }
+            do {
+                session.pullRequest = try await pullRequestService.syncWithBase(descriptor)
+                refreshGitSummary(session)
+                reviewQueueNotice = "Synced \(session.name) with \(session.pullRequest?.baseBranch ?? "the base branch")."
+            } catch {
+                reviewQueueNotice = error.localizedDescription
+            }
+        }
+    }
+
+    func squashMergePullRequest(_ session: AgentSession) {
+        guard mergingSessionID == nil,
+              let descriptor = session.worktree,
+              session.pullRequest?.isReadyToMerge == true else {
+            return
+        }
+        reviewQueueNotice = nil
+        mergingSessionID = session.id
+        session.isPublishingPullRequest = true
+        Task {
+            defer {
+                session.isPublishingPullRequest = false
+                mergingSessionID = nil
+            }
+            do {
+                let merged = try await pullRequestService.squashMerge(descriptor)
+                session.pullRequest = merged
+                guard merged.state == .merged else {
+                    reviewQueueNotice = "GitHub accepted PR #\(merged.number) for merging, but it is still open. The agent and worktree were preserved while GitHub finishes its merge queue."
+                    return
+                }
+                session.runtime?.stop(preservingSessionStatus: true)
+
+                let hasChanges = try await worktreeManager.hasUncommittedChanges(descriptor)
+                if hasChanges {
+                    session.status = .needsYou("PR merged; uncommitted work remains")
+                    reviewQueueNotice = "Merged PR #\(merged.number). \(session.name)’s worktree was preserved because it still has uncommitted changes."
+                } else {
+                    do {
+                        try await worktreeManager.removeWorktree(descriptor, force: false)
+                        session.status = .completed
+                        session.isArchived = true
+                        if selectedSessionID == session.id {
+                            select(nil)
+                        }
+                        reviewQueueNotice = "Merged PR #\(merged.number) and archived \(session.name). The Git branch was preserved."
+                    } catch {
+                        session.status = .completed
+                        reviewQueueNotice = "Merged PR #\(merged.number), but the worktree could not be removed: \(error.localizedDescription)"
+                    }
+                }
+
+                for candidate in sessions where candidate.id != session.id
+                    && !candidate.isArchived && candidate.pullRequest?.state == .open {
+                    refreshPullRequest(candidate)
+                }
+            } catch {
+                reviewQueueNotice = error.localizedDescription
+            }
         }
     }
 
@@ -674,7 +780,31 @@ final class WorkspaceModel: ObservableObject {
                 isDraft: pullRequest.isDraft,
                 headBranch: pullRequest.headBranch,
                 baseBranch: pullRequest.baseBranch,
-                updatedAt: pullRequest.updatedAt
+                updatedAt: pullRequest.updatedAt,
+                title: pullRequest.title ?? "",
+                mergeability: PullRequestMergeability(
+                    rawValue: pullRequest.mergeability ?? ""
+                ) ?? .unknown,
+                mergeStateStatus: pullRequest.mergeStateStatus ?? "UNKNOWN",
+                checksStatus: PullRequestChecksStatus(
+                    rawValue: pullRequest.checksStatus ?? ""
+                ) ?? .noChecks,
+                reviewDecision: PullRequestReviewDecision(
+                    rawValue: pullRequest.reviewDecision ?? ""
+                ) ?? .none,
+                headCommitOID: pullRequest.headCommitOID,
+                changedFiles: pullRequest.changedFiles ?? 0,
+                additions: pullRequest.additions ?? 0,
+                deletions: pullRequest.deletions ?? 0,
+                checks: (pullRequest.checks ?? []).map {
+                    PullRequestCheck(
+                        name: $0.name,
+                        workflow: $0.workflow,
+                        state: $0.state,
+                        bucket: $0.bucket,
+                        link: $0.link
+                    )
+                }
             )
         }
         if let worktree = stored.worktree {
@@ -686,7 +816,9 @@ final class WorkspaceModel: ObservableObject {
             )
             session.status = FileManager.default.fileExists(atPath: worktree.worktreePath)
                 ? .stopped
-                : .failed("The agent worktree no longer exists on disk.")
+                : (session.isArchived && session.pullRequest?.state == .merged
+                    ? .completed
+                    : .failed("The agent worktree no longer exists on disk."))
         } else {
             session.status = .failed("This agent does not have an assigned worktree.")
         }
@@ -726,7 +858,25 @@ final class WorkspaceModel: ObservableObject {
                             isDraft: pullRequest.isDraft,
                             headBranch: pullRequest.headBranch,
                             baseBranch: pullRequest.baseBranch,
-                            updatedAt: pullRequest.updatedAt
+                            updatedAt: pullRequest.updatedAt,
+                            title: pullRequest.title,
+                            mergeability: pullRequest.mergeability.rawValue,
+                            mergeStateStatus: pullRequest.mergeStateStatus,
+                            checksStatus: pullRequest.checksStatus.rawValue,
+                            reviewDecision: pullRequest.reviewDecision.rawValue,
+                            headCommitOID: pullRequest.headCommitOID,
+                            changedFiles: pullRequest.changedFiles,
+                            additions: pullRequest.additions,
+                            deletions: pullRequest.deletions,
+                            checks: pullRequest.checks.map {
+                                PersistedPullRequestCheck(
+                                    name: $0.name,
+                                    workflow: $0.workflow,
+                                    state: $0.state,
+                                    bucket: $0.bucket,
+                                    link: $0.link
+                                )
+                            }
                         )
                     }
                 )

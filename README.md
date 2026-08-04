@@ -20,6 +20,7 @@ The first vertical slice is functional:
 - Per-agent Git review with changed files, commits, patches, test execution, merge, and cherry-pick actions.
 - Main-project, per-agent worktree, and generated multi-root workspace launch in installed Cursor or Visual Studio Code applications.
 - Per-agent draft GitHub PR publishing, persisted PR status, and branch update actions through authenticated GitHub CLI.
+- Project review queue with GitHub checks, review and conflict states, base-branch synchronization, guarded squash merge, and post-merge worktree archiving.
 - One automatically-created branch and worktree per session.
 - Full ANSI color, keyboard input, selection, scrolling, resizing, and terminal escape-sequence support.
 - Draggable and resizable terminal cards.

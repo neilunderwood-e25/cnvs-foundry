@@ -61,6 +61,7 @@ final class AgentTerminalRuntime: NSObject, LocalProcessTerminalViewDelegate {
 
     private weak var session: AgentSession?
     private var didRequestStop = false
+    private var preservesSessionStatusOnStop = false
 
     init(
         session: AgentSession,
@@ -93,10 +94,13 @@ final class AgentTerminalRuntime: NSObject, LocalProcessTerminalViewDelegate {
         terminalView.window?.makeFirstResponder(terminalView)
     }
 
-    func stop() {
+    func stop(preservingSessionStatus: Bool = false) {
         guard session?.status.isActive == true else { return }
         didRequestStop = true
-        session?.status = .stopped
+        preservesSessionStatusOnStop = preservingSessionStatus
+        if !preservingSessionStatus {
+            session?.status = .stopped
+        }
         terminalView.terminate()
     }
 
@@ -123,7 +127,9 @@ final class AgentTerminalRuntime: NSObject, LocalProcessTerminalViewDelegate {
         Task { @MainActor [weak self] in
             guard let self, let session = self.session else { return }
             if self.didRequestStop {
-                session.status = .stopped
+                if !self.preservesSessionStatusOnStop {
+                    session.status = .stopped
+                }
             } else if exitCode == 0 {
                 session.status = .completed
             } else if exitCode == 127 {

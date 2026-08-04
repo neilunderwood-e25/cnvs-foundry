@@ -58,6 +58,24 @@ struct PersistedPullRequest: Codable, Equatable {
     let headBranch: String
     let baseBranch: String
     let updatedAt: Date
+    let title: String?
+    let mergeability: String?
+    let mergeStateStatus: String?
+    let checksStatus: String?
+    let reviewDecision: String?
+    let headCommitOID: String?
+    let changedFiles: Int?
+    let additions: Int?
+    let deletions: Int?
+    let checks: [PersistedPullRequestCheck]?
+}
+
+struct PersistedPullRequestCheck: Codable, Equatable {
+    let name: String
+    let workflow: String?
+    let state: String
+    let bucket: String
+    let link: URL?
 }
 
 struct WorkspacePersistence: Sendable {

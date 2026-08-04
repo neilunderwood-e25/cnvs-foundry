@@ -160,9 +160,9 @@ private struct FleetAgentRow: View {
             Spacer(minLength: 2)
 
             if let pullRequest = session.pullRequest {
-                Text(pullRequest.isDraft ? "DRAFT #\(pullRequest.number)" : "#\(pullRequest.number)")
+                Text(pullRequest.queueState.label.uppercased())
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(pullRequest.state == .open ? .cyan : .secondary)
+                    .foregroundStyle(pullRequestBadgeColor(pullRequest.queueState))
             }
 
             if session.gitSummary.isRefreshing {
@@ -206,7 +206,7 @@ private struct FleetAgentRow: View {
         if session.worktree != nil {
             Button("Review Git Changes", action: onReview)
             if session.isPublishingPullRequest {
-                Button("Publishing Pull Request…") {}
+                Button("Updating Pull Request…") {}
                     .disabled(true)
             } else if let pullRequest = session.pullRequest {
                 Button("Open \(pullRequest.displayLabel)", action: onOpenPullRequest)
@@ -260,6 +260,15 @@ private struct FleetAgentRow: View {
         case .needsYou: .orange
         case .stopped: .secondary
         case .failed: .red
+        }
+    }
+
+    private func pullRequestBadgeColor(_ state: PullRequestQueueState) -> Color {
+        switch state {
+        case .readyToMerge, .merged: .green
+        case .checksFailed, .changesRequested, .conflict: .red
+        case .draft, .checksPending, .reviewRequired, .behind: .orange
+        case .blocked, .closed: .secondary
         }
     }
 }
