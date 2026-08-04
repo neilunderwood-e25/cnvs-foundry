@@ -9,6 +9,9 @@ struct AgentCardView: View {
     let onArchive: () -> Void
     let onDelete: () -> Void
     let onOpenInIDE: (ProjectIDE) -> Void
+    let onPreparePullRequest: () -> Void
+    let onOpenPullRequest: () -> Void
+    let onPushPullRequestUpdates: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -68,6 +71,17 @@ struct AgentCardView: View {
                 if let worktree = session.worktree {
                     Button("Review Git Changes") {
                         onReview()
+                    }
+                    if session.isPublishingPullRequest {
+                        Button("Publishing Pull Request…") {}
+                            .disabled(true)
+                    } else if let pullRequest = session.pullRequest {
+                        Button("Open \(pullRequest.displayLabel)", action: onOpenPullRequest)
+                        if pullRequest.state == .open {
+                            Button("Push PR Updates", action: onPushPullRequestUpdates)
+                        }
+                    } else {
+                        Button("Publish Draft PR", action: onPreparePullRequest)
                     }
                     ForEach(installedIDEs) { ide in
                         Button("Open \(session.name) Worktree in \(ide.shortDisplayName)") {
@@ -151,6 +165,15 @@ struct AgentCardView: View {
             Text(session.worktree?.branchName ?? "allocating worktree")
                 .lineLimit(1)
             Spacer()
+            if let pullRequest = session.pullRequest {
+                Button(action: onOpenPullRequest) {
+                    Text(pullRequest.displayLabel)
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(pullRequest.state == .open ? .cyan : .secondary)
+                .help("Open pull request")
+            }
             if session.gitSummary.changedFileCount > 0 {
                 Button(action: onReview) {
                     Label(

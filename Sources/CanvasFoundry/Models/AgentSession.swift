@@ -66,6 +66,34 @@ enum AgentTestStatus: Equatable {
     }
 }
 
+enum PullRequestState: String, Equatable {
+    case open
+    case closed
+    case merged
+    case unknown
+
+    var label: String {
+        rawValue.capitalized
+    }
+}
+
+struct AgentPullRequest: Equatable {
+    let number: Int
+    let url: URL
+    let state: PullRequestState
+    let isDraft: Bool
+    let headBranch: String
+    let baseBranch: String
+    let updatedAt: Date
+
+    var displayLabel: String {
+        if state == .open && isDraft {
+            return "Draft PR #\(number)"
+        }
+        return "\(state.label) PR #\(number)"
+    }
+}
+
 @MainActor
 final class AgentSession: ObservableObject, Identifiable {
     let id: UUID
@@ -82,6 +110,8 @@ final class AgentSession: ObservableObject, Identifiable {
     @Published var isArchived = false
     @Published var gitSummary = AgentGitSummary()
     @Published var testStatus: AgentTestStatus = .notRun
+    @Published var pullRequest: AgentPullRequest?
+    @Published var isPublishingPullRequest = false
 
     @Published var runtime: AgentTerminalRuntime?
 

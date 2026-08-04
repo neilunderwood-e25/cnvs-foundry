@@ -49,6 +49,7 @@ enum WorkspaceAlertState: Identifiable, Equatable {
     case bootstrap(RepositoryBootstrapRequest)
     case deleteWorktree(WorktreeDeletionRequest)
     case switchProject(ProjectSwitchRequest)
+    case publishPullRequest(PullRequestPublishRequest)
 
     var id: String {
         switch self {
@@ -60,6 +61,8 @@ enum WorkspaceAlertState: Identifiable, Equatable {
             "delete-worktree-\(request.sessionID)-\(request.hasUncommittedChanges)"
         case .switchProject(let request):
             "switch-project-\(request.projectURL.path)"
+        case .publishPullRequest(let request):
+            "publish-pr-\(request.sessionID)-\(request.commitCount)-\(request.hasUncommittedChanges)"
         }
     }
 }
@@ -73,6 +76,16 @@ struct WorktreeDeletionRequest: Equatable {
 struct ProjectSwitchRequest: Equatable {
     let projectURL: URL
     let existingAgentCount: Int
+}
+
+struct PullRequestPublishRequest: Equatable {
+    let sessionID: UUID
+    let agentName: String
+    let commitCount: Int
+    let hasUncommittedChanges: Bool
+    let baseBranch: String
+    let suggestedTitle: String
+    let testStatus: AgentTestStatus
 }
 
 @MainActor
@@ -102,6 +115,7 @@ final class WorkspaceModel: ObservableObject {
     private let projectManager: GitProjectManager
     private let persistence: WorkspacePersistence
     let gitReviewService: GitReviewService
+    private let pullRequestService: GitHubPullRequestService
     private var viewportSize = CGSize(width: 1200, height: 760)
     private var sessionObservers: [UUID: AnyCancellable] = [:]
     private var persistenceTask: Task<Void, Never>?
@@ -111,12 +125,14 @@ final class WorkspaceModel: ObservableObject {
         worktreeManager: GitWorktreeManager = GitWorktreeManager(),
         projectManager: GitProjectManager = GitProjectManager(),
         persistence: WorkspacePersistence = WorkspacePersistence(),
-        gitReviewService: GitReviewService = GitReviewService()
+        gitReviewService: GitReviewService = GitReviewService(),
+        pullRequestService: GitHubPullRequestService = GitHubPullRequestService()
     ) {
         self.worktreeManager = worktreeManager
         self.projectManager = projectManager
         self.persistence = persistence
         self.gitReviewService = gitReviewService
+        self.pullRequestService = pullRequestService
         restoreWorkspace()
         isRestoring = false
         observeSessions()
@@ -273,6 +289,114 @@ final class WorkspaceModel: ObservableObject {
             } catch {
                 alertState = .message(error.localizedDescription)
             }
+        }
+    }
+
+    func preparePullRequest(_ session: AgentSession) {
+        guard let descriptor = session.worktree,
+              !session.isPublishingPullRequest else {
+            return
+        }
+        session.isPublishingPullRequest = true
+        Task {
+            defer { session.isPublishingPullRequest = false }
+            do {
+                let preflight = try await pullRequestService.preflight(descriptor)
+                if let existing = preflight.existingPullRequest {
+                    session.pullRequest = existing
+                    openPullRequest(session)
+                    return
+                }
+                alertState = .publishPullRequest(
+                    PullRequestPublishRequest(
+                        sessionID: session.id,
+                        agentName: session.name,
+                        commitCount: preflight.commitCount,
+                        hasUncommittedChanges: preflight.hasUncommittedChanges,
+                        baseBranch: preflight.baseBranch,
+                        suggestedTitle: preflight.suggestedTitle,
+                        testStatus: session.testStatus
+                    )
+                )
+            } catch {
+                alertState = .message(error.localizedDescription)
+            }
+        }
+    }
+
+    func publishPullRequest(_ request: PullRequestPublishRequest) {
+        alertState = nil
+        guard let session = sessions.first(where: { $0.id == request.sessionID }),
+              let descriptor = session.worktree,
+              !session.isPublishingPullRequest else {
+            return
+        }
+        session.isPublishingPullRequest = true
+        Task {
+            defer { session.isPublishingPullRequest = false }
+            do {
+                let pullRequest = try await pullRequestService.publishDraft(
+                    descriptor,
+                    agentName: session.name,
+                    testStatus: session.testStatus
+                )
+                session.pullRequest = pullRequest
+                NSWorkspace.shared.open(pullRequest.url)
+                alertState = .message(
+                    "Published draft PR #\(pullRequest.number) against \(pullRequest.baseBranch)."
+                )
+            } catch {
+                alertState = .message(error.localizedDescription)
+            }
+        }
+    }
+
+    func pushPullRequestUpdates(_ session: AgentSession) {
+        guard let descriptor = session.worktree,
+              !session.isPublishingPullRequest else {
+            return
+        }
+        session.isPublishingPullRequest = true
+        Task {
+            defer { session.isPublishingPullRequest = false }
+            do {
+                session.pullRequest = try await pullRequestService.pushUpdates(descriptor)
+                alertState = .message(
+                    "Pushed the latest \(session.name) commits to PR #\(session.pullRequest?.number ?? 0)."
+                )
+            } catch {
+                alertState = .message(error.localizedDescription)
+            }
+        }
+    }
+
+    func openPullRequest(_ session: AgentSession) {
+        guard let url = session.pullRequest?.url else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func refreshPullRequest(_ session: AgentSession, reportErrors: Bool = false) {
+        guard session.pullRequest != nil,
+              let descriptor = session.worktree,
+              !session.isPublishingPullRequest else {
+            return
+        }
+        session.isPublishingPullRequest = true
+        Task {
+            defer { session.isPublishingPullRequest = false }
+            do {
+                session.pullRequest = try await pullRequestService.refresh(descriptor)
+            } catch {
+                if reportErrors {
+                    alertState = .message(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    func refreshAllPullRequests() {
+        for session in sessions where !session.isArchived && session.pullRequest != nil {
+            refreshPullRequest(session)
         }
     }
 
@@ -542,6 +666,17 @@ final class WorkspaceModel: ObservableObject {
             height: max(280, stored.height)
         )
         session.isArchived = stored.isArchived ?? false
+        if let pullRequest = stored.pullRequest {
+            session.pullRequest = AgentPullRequest(
+                number: pullRequest.number,
+                url: pullRequest.url,
+                state: PullRequestState(rawValue: pullRequest.state) ?? .unknown,
+                isDraft: pullRequest.isDraft,
+                headBranch: pullRequest.headBranch,
+                baseBranch: pullRequest.baseBranch,
+                updatedAt: pullRequest.updatedAt
+            )
+        }
         if let worktree = stored.worktree {
             session.worktree = WorktreeDescriptor(
                 projectRoot: URL(fileURLWithPath: worktree.projectRootPath, isDirectory: true),
@@ -581,6 +716,17 @@ final class WorkspaceModel: ObservableObject {
                             worktreePath: worktree.worktreeURL.path,
                             branchName: worktree.branchName,
                             baseRevision: worktree.baseRevision
+                        )
+                    },
+                    pullRequest: session.pullRequest.map { pullRequest in
+                        PersistedPullRequest(
+                            number: pullRequest.number,
+                            url: pullRequest.url,
+                            state: pullRequest.state.rawValue,
+                            isDraft: pullRequest.isDraft,
+                            headBranch: pullRequest.headBranch,
+                            baseBranch: pullRequest.baseBranch,
+                            updatedAt: pullRequest.updatedAt
                         )
                     }
                 )

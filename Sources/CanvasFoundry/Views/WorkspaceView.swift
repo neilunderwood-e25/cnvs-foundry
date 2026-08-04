@@ -29,6 +29,7 @@ struct WorkspaceView: View {
         }
         .task {
             model.refreshAllGitSummaries()
+            model.refreshAllPullRequests()
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase != .active {
@@ -86,16 +87,47 @@ struct WorkspaceView: View {
                     },
                     secondaryButton: .cancel()
                 )
+            case .publishPullRequest(let request):
+                Alert(
+                    title: Text("Publish \(request.agentName) as a Draft PR?"),
+                    message: Text(pullRequestConfirmationMessage(request)),
+                    primaryButton: .default(Text("Publish Draft PR")) {
+                        model.publishPullRequest(request)
+                    },
+                    secondaryButton: .cancel()
+                )
             }
         }
         .sheet(item: $model.reviewingSession) { session in
             AgentGitReviewView(
                 session: session,
                 service: model.gitReviewService,
-                onRepositoryChanged: model.refreshAllGitSummaries
+                onRepositoryChanged: model.refreshAllGitSummaries,
+                onPreparePullRequest: {
+                    model.reviewingSession = nil
+                    model.preparePullRequest(session)
+                },
+                onOpenPullRequest: { model.openPullRequest(session) },
+                onPushPullRequestUpdates: { model.pushPullRequestUpdates(session) }
             )
             .frame(minWidth: 940, minHeight: 680)
         }
+    }
+
+    private func pullRequestConfirmationMessage(
+        _ request: PullRequestPublishRequest
+    ) -> String {
+        var lines = [
+            "“\(request.suggestedTitle)”",
+            "\(request.commitCount) commit\(request.commitCount == 1 ? "" : "s") will be pushed to origin and opened against \(request.baseBranch)."
+        ]
+        if request.hasUncommittedChanges {
+            lines.append("Warning: uncommitted worktree changes will not be included.")
+        }
+        if request.testStatus != .passed {
+            lines.append("Warning: tests are currently \(request.testStatus.label.lowercased()).")
+        }
+        return lines.joined(separator: "\n\n")
     }
 
     private var header: some View {

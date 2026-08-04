@@ -40,6 +40,7 @@ struct PersistedAgentSession: Codable, Equatable {
     let height: Double
     let isArchived: Bool?
     let worktree: PersistedWorktree?
+    let pullRequest: PersistedPullRequest?
 }
 
 struct PersistedWorktree: Codable, Equatable {
@@ -47,6 +48,16 @@ struct PersistedWorktree: Codable, Equatable {
     let worktreePath: String
     let branchName: String
     let baseRevision: String?
+}
+
+struct PersistedPullRequest: Codable, Equatable {
+    let number: Int
+    let url: URL
+    let state: String
+    let isDraft: Bool
+    let headBranch: String
+    let baseBranch: String
+    let updatedAt: Date
 }
 
 struct WorkspacePersistence: Sendable {

@@ -32,6 +32,12 @@ struct InfiniteCanvasView: View {
                             model.prepareWorktreeDeletion(session)
                         } onOpenInIDE: { ide in
                             model.openAgentWorktree(session, in: ide)
+                        } onPreparePullRequest: {
+                            model.preparePullRequest(session)
+                        } onOpenPullRequest: {
+                            model.openPullRequest(session)
+                        } onPushPullRequestUpdates: {
+                            model.pushPullRequestUpdates(session)
                         }
                     }
                 }
@@ -112,6 +118,9 @@ private struct CanvasAgentNode: View {
     let onArchive: () -> Void
     let onDelete: () -> Void
     let onOpenInIDE: (ProjectIDE) -> Void
+    let onPreparePullRequest: () -> Void
+    let onOpenPullRequest: () -> Void
+    let onPushPullRequestUpdates: () -> Void
 
     var body: some View {
         NativeTerminalCardContainer(
@@ -122,7 +131,10 @@ private struct CanvasAgentNode: View {
                 onReview: onReview,
                 onArchive: onArchive,
                 onDelete: onDelete,
-                onOpenInIDE: onOpenInIDE
+                onOpenInIDE: onOpenInIDE,
+                onPreparePullRequest: onPreparePullRequest,
+                onOpenPullRequest: onOpenPullRequest,
+                onPushPullRequestUpdates: onPushPullRequestUpdates
             ),
             onInteractionBegan: onSelect,
             onMoveEnded: { translation in

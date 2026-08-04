@@ -65,6 +65,9 @@ struct AgentFleetSidebar: View {
                         onRestore: { model.restore(session) },
                         onReview: { model.review(session) },
                         onOpenInIDE: { model.openAgentWorktree(session, in: $0) },
+                        onPreparePullRequest: { model.preparePullRequest(session) },
+                        onOpenPullRequest: { model.openPullRequest(session) },
+                        onPushPullRequestUpdates: { model.pushPullRequestUpdates(session) },
                         onDelete: { model.prepareWorktreeDeletion(session) }
                     )
                 }
@@ -114,6 +117,9 @@ private struct FleetAgentRow: View {
     let onRestore: () -> Void
     let onReview: () -> Void
     let onOpenInIDE: (ProjectIDE) -> Void
+    let onPreparePullRequest: () -> Void
+    let onOpenPullRequest: () -> Void
+    let onPushPullRequestUpdates: () -> Void
     let onDelete: () -> Void
 
     @State private var isRenaming = false
@@ -152,6 +158,12 @@ private struct FleetAgentRow: View {
             }
 
             Spacer(minLength: 2)
+
+            if let pullRequest = session.pullRequest {
+                Text(pullRequest.isDraft ? "DRAFT #\(pullRequest.number)" : "#\(pullRequest.number)")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(pullRequest.state == .open ? .cyan : .secondary)
+            }
 
             if session.gitSummary.isRefreshing {
                 ProgressView()
@@ -193,6 +205,17 @@ private struct FleetAgentRow: View {
         Button("Rename", action: beginRename)
         if session.worktree != nil {
             Button("Review Git Changes", action: onReview)
+            if session.isPublishingPullRequest {
+                Button("Publishing Pull Request…") {}
+                    .disabled(true)
+            } else if let pullRequest = session.pullRequest {
+                Button("Open \(pullRequest.displayLabel)", action: onOpenPullRequest)
+                if pullRequest.state == .open {
+                    Button("Push PR Updates", action: onPushPullRequestUpdates)
+                }
+            } else {
+                Button("Publish Draft PR", action: onPreparePullRequest)
+            }
             ForEach(installedIDEs) { ide in
                 Button("Open Worktree in \(ide.shortDisplayName)") {
                     onOpenInIDE(ide)

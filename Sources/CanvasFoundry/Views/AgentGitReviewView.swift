@@ -4,6 +4,9 @@ struct AgentGitReviewView: View {
     @ObservedObject var session: AgentSession
     let service: GitReviewService
     let onRepositoryChanged: () -> Void
+    let onPreparePullRequest: () -> Void
+    let onOpenPullRequest: () -> Void
+    let onPushPullRequestUpdates: () -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var snapshot: GitReviewSnapshot?
@@ -75,6 +78,8 @@ struct AgentGitReviewView: View {
 
             testStatusLabel
 
+            pullRequestControls
+
             Button {
                 runTests()
             } label: {
@@ -95,6 +100,27 @@ struct AgentGitReviewView: View {
         }
         .padding(.horizontal, 18)
         .frame(height: 62)
+    }
+
+    @ViewBuilder
+    private var pullRequestControls: some View {
+        if session.isPublishingPullRequest {
+            ProgressView()
+                .controlSize(.small)
+                .help("Publishing pull request")
+        } else if let pullRequest = session.pullRequest {
+            Button("Open \(pullRequest.displayLabel)", action: onOpenPullRequest)
+            if pullRequest.state == .open {
+                Button("Push Updates", action: onPushPullRequestUpdates)
+            }
+        } else {
+            Button {
+                dismiss()
+                onPreparePullRequest()
+            } label: {
+                Label("Publish Draft PR", systemImage: "arrow.up.right.square")
+            }
+        }
     }
 
     private func reviewContent(_ snapshot: GitReviewSnapshot) -> some View {

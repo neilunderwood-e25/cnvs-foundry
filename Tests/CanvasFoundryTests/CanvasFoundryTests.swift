@@ -164,6 +164,16 @@ final class CanvasFoundryTests: XCTestCase {
             branchName: "canvas/grace-codex-12345678",
             baseRevision: "deadbeef"
         )
+        let pullRequestDate = Date(timeIntervalSince1970: 1_700_000_000)
+        sourceSession.pullRequest = AgentPullRequest(
+            number: 42,
+            url: URL(string: "https://github.com/example/project/pull/42")!,
+            state: .open,
+            isDraft: true,
+            headBranch: "canvas/grace-codex-12345678",
+            baseBranch: "main",
+            updatedAt: pullRequestDate
+        )
         sourceModel.sessions = [sourceSession]
         sourceModel.select(sourceSession)
         sourceModel.persistWorkspace()
@@ -183,6 +193,10 @@ final class CanvasFoundryTests: XCTestCase {
         XCTAssertEqual(restored.size, CGSize(width: 680, height: 440))
         XCTAssertEqual(restored.worktree?.branchName, "canvas/grace-codex-12345678")
         XCTAssertEqual(restored.worktree?.baseRevision, "deadbeef")
+        XCTAssertEqual(restored.pullRequest?.number, 42)
+        XCTAssertEqual(restored.pullRequest?.state, .open)
+        XCTAssertEqual(restored.pullRequest?.isDraft, true)
+        XCTAssertEqual(restored.pullRequest?.updatedAt, pullRequestDate)
         XCTAssertEqual(restored.status, .stopped)
         XCTAssertTrue(restored.isSelected)
         XCTAssertNil(restored.runtime)
@@ -415,6 +429,122 @@ final class CanvasFoundryTests: XCTestCase {
             currentDirectoryURL: repository
         )
         XCTAssertEqual(branchResult.exitCode, 0, "Removing a worktree must preserve its branch")
+    }
+
+    func testDraftPullRequestWorkflowPushesAndCreatesPR() async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CanvasFoundryPR-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let project = scratch.appendingPathComponent("project", isDirectory: true)
+        let worktree = scratch.appendingPathComponent("worktree", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: worktree, withIntermediateDirectories: true)
+
+        let pullRequestState = scratch.appendingPathComponent("pr-created")
+        let gitLog = scratch.appendingPathComponent("git.log")
+        let ghLog = scratch.appendingPathComponent("gh.log")
+        let fakeGit = scratch.appendingPathComponent("git")
+        let fakeGitHub = scratch.appendingPathComponent("gh")
+
+        let gitScript = """
+        #!/bin/sh
+        printf '%s\n' "$*" >> "\(gitLog.path)"
+        if [ "$1" = "remote" ]; then
+          echo 'git@github.com:example/project.git'
+        elif [ "$1" = "rev-list" ]; then
+          echo '2'
+        elif [ "$1" = "status" ]; then
+          echo ' M Sources/Feature.swift'
+        elif [ "$1" = "log" ]; then
+          echo 'Add agent feature'
+        fi
+        exit 0
+        """
+        let ghScript = """
+        #!/bin/sh
+        printf '%s\n' "$*" >> "\(ghLog.path)"
+        if [ "$1" = "auth" ]; then
+          exit 0
+        elif [ "$1" = "repo" ]; then
+          echo '{"defaultBranchRef":{"name":"main"}}'
+          exit 0
+        elif [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+          if [ -f "\(pullRequestState.path)" ]; then
+            echo '{"number":17,"url":"https://github.com/example/project/pull/17","state":"OPEN","isDraft":true,"headRefName":"canvas/ada-claude-12345678","baseRefName":"main"}'
+            exit 0
+          fi
+          exit 1
+        elif [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+          touch "\(pullRequestState.path)"
+          echo 'https://github.com/example/project/pull/17'
+          exit 0
+        fi
+        exit 1
+        """
+        try Data(gitScript.utf8).write(to: fakeGit)
+        try Data(ghScript.utf8).write(to: fakeGitHub)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeGit.path
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeGitHub.path
+        )
+
+        let descriptor = WorktreeDescriptor(
+            projectRoot: project,
+            worktreeURL: worktree,
+            branchName: "canvas/ada-claude-12345678",
+            baseRevision: "abc123"
+        )
+        let service = GitHubPullRequestService(gitURL: fakeGit, ghURL: fakeGitHub)
+        let preflight = try await service.preflight(descriptor)
+        XCTAssertEqual(preflight.commitCount, 2)
+        XCTAssertEqual(preflight.baseBranch, "main")
+        XCTAssertEqual(preflight.suggestedTitle, "Add agent feature")
+        XCTAssertTrue(preflight.hasUncommittedChanges)
+        XCTAssertNil(preflight.existingPullRequest)
+
+        let pullRequest = try await service.publishDraft(
+            descriptor,
+            agentName: "Ada",
+            testStatus: .passed
+        )
+        XCTAssertEqual(pullRequest.number, 17)
+        XCTAssertEqual(pullRequest.state, .open)
+        XCTAssertTrue(pullRequest.isDraft)
+        XCTAssertEqual(pullRequest.baseBranch, "main")
+
+        let recordedGitCommands = try String(contentsOf: gitLog, encoding: .utf8)
+        XCTAssertTrue(
+            recordedGitCommands.contains(
+                "push --set-upstream origin canvas/ada-claude-12345678"
+            )
+        )
+        let recordedGitHubCommands = try String(contentsOf: ghLog, encoding: .utf8)
+        XCTAssertTrue(recordedGitHubCommands.contains("pr create --draft"))
+        XCTAssertTrue(recordedGitHubCommands.contains("--base main"))
+        XCTAssertTrue(recordedGitHubCommands.contains("--title Add agent feature"))
+    }
+
+    func testPullRequestWorkflowExplainsMissingGitHubCLI() async throws {
+        let scratch = FileManager.default.temporaryDirectory
+        let descriptor = WorktreeDescriptor(
+            projectRoot: scratch,
+            worktreeURL: scratch,
+            branchName: "canvas/test",
+            baseRevision: "abc123"
+        )
+        let service = GitHubPullRequestService(ghURL: nil)
+
+        do {
+            _ = try await service.preflight(descriptor)
+            XCTFail("Expected a missing GitHub CLI error")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("brew install gh"))
+            XCTAssertTrue(error.localizedDescription.contains("gh auth login"))
+        }
     }
 
     func testEmptyFolderCanBeInitializedForAgentWorktrees() async throws {

@@ -19,6 +19,7 @@ The first vertical slice is functional:
 - Fleet sidebar with focus navigation, inline renaming, archive/restore, and guarded worktree removal.
 - Per-agent Git review with changed files, commits, patches, test execution, merge, and cherry-pick actions.
 - Main-project, per-agent worktree, and generated multi-root workspace launch in installed Cursor or Visual Studio Code applications.
+- Per-agent draft GitHub PR publishing, persisted PR status, and branch update actions through authenticated GitHub CLI.
 - One automatically-created branch and worktree per session.
 - Full ANSI color, keyboard input, selection, scrolling, resizing, and terminal escape-sequence support.
 - Draggable and resizable terminal cards.
@@ -38,6 +39,7 @@ Canvas Foundry intentionally uses the user's existing CLI authentication. It doe
 - At least one supported CLI on `PATH`:
   - [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
   - [OpenAI Codex CLI](https://github.com/openai/codex)
+- To publish pull requests: [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login`.
 
 ## Run
 
