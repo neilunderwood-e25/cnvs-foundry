@@ -34,8 +34,11 @@ struct CanvasProjectBar: View {
 
     private var projectMenu: some View {
         Menu {
+            Button(action: model.createNewProject) {
+                Label("New Project…", systemImage: "plus")
+            }
             Button(action: model.chooseProject) {
-                Label("Add a New Project", systemImage: "plus")
+                Label("Open Project…", systemImage: "folder")
             }
 
             if !model.recentProjectURLs.isEmpty {

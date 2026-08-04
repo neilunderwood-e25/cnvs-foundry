@@ -28,8 +28,26 @@ struct CanvasFoundryApp: App {
                 Toggle("Command Bar", isOn: $isCommandBarVisible)
                     .keyboardShortcut("k", modifiers: .command)
             }
+            // The menu scene can't reach the window's @StateObject model, so
+            // these post notifications that WorkspaceView routes to the model —
+            // the same scene↔window plumbing reason ⌘K goes through AppStorage.
+            CommandGroup(replacing: .newItem) {
+                Button("New Project…") {
+                    NotificationCenter.default.post(name: .foundryNewProject, object: nil)
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+                Button("Open Project…") {
+                    NotificationCenter.default.post(name: .foundryOpenProject, object: nil)
+                }
+                .keyboardShortcut("o", modifiers: .command)
+            }
         }
     }
+}
+
+extension Notification.Name {
+    static let foundryNewProject = Notification.Name("foundry.newProject")
+    static let foundryOpenProject = Notification.Name("foundry.openProject")
 }
 
 final class CanvasFoundryAppDelegate: NSObject, NSApplicationDelegate {

@@ -191,15 +191,37 @@ final class WorkspaceModel: ObservableObject {
 
     func chooseProject() {
         let panel = NSOpenPanel()
-        panel.title = "Choose a Git project"
+        panel.title = "Choose a project folder"
         panel.prompt = "Open Project"
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.canCreateDirectories = false
+        // Any folder works now — repos open directly, everything else gets a
+        // consented initialization — so creating one here is fine too.
+        panel.canCreateDirectories = true
 
         if panel.runModal() == .OK, let selectedURL = panel.url {
             inspectProject(selectedURL)
+        }
+    }
+
+    /// Names and creates a brand-new project folder, initialized and ready for
+    /// agents in one step.
+    func createNewProject() {
+        let panel = NSSavePanel()
+        panel.title = "Create a new project"
+        panel.prompt = "Create Project"
+        panel.nameFieldLabel = "Project name:"
+        panel.nameFieldStringValue = "New Project"
+        panel.canCreateDirectories = true
+
+        guard panel.runModal() == .OK, let folderURL = panel.url else { return }
+        Task {
+            do {
+                activateProject(try await projectManager.createProject(at: folderURL))
+            } catch {
+                alertState = .message(error.localizedDescription)
+            }
         }
     }
 

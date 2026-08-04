@@ -23,9 +23,10 @@ struct WorkspaceView: View {
             InfiniteCanvasView(model: model)
                 .overlay {
                     if model.projectURL == nil {
-                        EmptyWorkspaceView {
-                            model.chooseProject()
-                        }
+                        EmptyWorkspaceView(
+                            onCreateProject: { model.createNewProject() },
+                            onChooseProject: { model.chooseProject() }
+                        )
                     }
                 }
                 // Layered last so the control floats above both the canvas and
@@ -53,6 +54,12 @@ struct WorkspaceView: View {
                 model.persistWorkspace()
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .foundryNewProject)) { _ in
+            model.createNewProject()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .foundryOpenProject)) { _ in
+            model.chooseProject()
+        }
         .alert(item: $model.alertState) { state in
             switch state {
             case .message(let message):
@@ -68,14 +75,8 @@ struct WorkspaceView: View {
                             ? "Initialize Git Repository?"
                             : "Create Initial Commit?"
                     ),
-                    message: Text(
-                        request.shouldInitializeGit
-                            ? "Canvas Foundry will initialize this empty folder locally and create the first commit required for isolated worktrees."
-                            : "This repository has no commits. Canvas Foundry can create an empty initial commit so agents can use isolated worktrees."
-                    ),
-                    primaryButton: .default(
-                        Text(request.shouldInitializeGit ? "Initialize Locally" : "Create Commit")
-                    ) {
+                    message: Text(bootstrapConfirmationMessage(request)),
+                    primaryButton: .default(Text(bootstrapButtonTitle(request))) {
                         model.initializeRepository(request)
                     },
                     secondaryButton: .cancel()
@@ -143,6 +144,27 @@ struct WorkspaceView: View {
         }
         .sheet(isPresented: $isReviewQueuePresented) {
             PullRequestReviewQueueView(model: model)
+        }
+    }
+
+    private func bootstrapConfirmationMessage(_ request: RepositoryBootstrapRequest) -> String {
+        switch (request.shouldInitializeGit, request.hasExistingFiles) {
+        case (true, true):
+            "This folder isn't a Git repository yet. Canvas Foundry will run git init and commit the existing files as “Initial commit”, so agents branch from your code."
+        case (true, false):
+            "Canvas Foundry will initialize this empty folder locally and create the first commit required for isolated worktrees."
+        case (false, true):
+            "This repository has no commits. Canvas Foundry will commit the existing files as “Initial commit” so agents can use isolated worktrees."
+        case (false, false):
+            "This repository has no commits. Canvas Foundry can create an empty initial commit so agents can use isolated worktrees."
+        }
+    }
+
+    private func bootstrapButtonTitle(_ request: RepositoryBootstrapRequest) -> String {
+        switch (request.shouldInitializeGit, request.hasExistingFiles) {
+        case (true, true): "Initialize & Commit Files"
+        case (true, false): "Initialize Locally"
+        case (false, _): "Create Commit"
         }
     }
 
@@ -257,6 +279,7 @@ private struct IDELaunchToolbarMenu: View {
 }
 
 private struct EmptyWorkspaceView: View {
+    let onCreateProject: () -> Void
     let onChooseProject: () -> Void
 
     var body: some View {
@@ -264,15 +287,19 @@ private struct EmptyWorkspaceView: View {
             FoundryMarkView(size: 56)
             Text("Your agents need a place to build")
                 .font(.foundry(size: 24, weight: .semibold))
-            Text("Choose a Git project or an empty folder to initialize locally. Every CLI agent gets its own branch and worktree.")
+            Text("Open any folder — Git repos open directly, everything else can be initialized in one step. Every CLI agent gets its own branch and worktree.")
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 510)
                 .lineSpacing(4)
-            Button("Choose Git Project", action: onChooseProject)
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
-                .controlSize(.large)
+            HStack(spacing: 12) {
+                Button("Create New Project", action: onCreateProject)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                Button("Open Existing Folder…", action: onChooseProject)
+                    .buttonStyle(.bordered)
+            }
+            .controlSize(.large)
         }
         .padding(38)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))

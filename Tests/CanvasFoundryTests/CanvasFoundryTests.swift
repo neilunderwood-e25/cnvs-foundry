@@ -1815,7 +1815,7 @@ final class CanvasFoundryTests: XCTestCase {
         XCTAssertEqual(headResult.exitCode, 0)
     }
 
-    func testNonGitFolderWithFilesIsNotSilentlyInitialized() async throws {
+    func testNonGitFolderWithFilesRequiresConsentThenCommitsThem() async throws {
         let scratch = FileManager.default.temporaryDirectory
             .appendingPathComponent("CanvasFoundryNonGit-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
@@ -1824,10 +1824,91 @@ final class CanvasFoundryTests: XCTestCase {
             to: scratch.appendingPathComponent("notes.txt")
         )
 
-        let inspection = try await GitProjectManager().inspect(scratch)
-        guard case .unsupported = inspection else {
-            return XCTFail("Expected a non-empty, non-Git folder to be rejected")
+        // Still never silent: inspect only *offers* initialization — the
+        // consent alert stands between this and any git command running.
+        let manager = GitProjectManager()
+        let inspection = try await manager.inspect(scratch)
+        guard case .needsBootstrap(let request) = inspection else {
+            return XCTFail("Expected a folder with files to offer initialization")
         }
+        XCTAssertTrue(request.shouldInitializeGit)
+        XCTAssertTrue(
+            request.hasExistingFiles,
+            "the consent copy must warn that existing files will be committed"
+        )
+
+        // After consent, existing files must land in the initial commit —
+        // agent worktrees branch from it and would otherwise be empty.
+        let root = try await manager.bootstrap(request)
+        let shell = ShellRunner()
+        let git = URL(fileURLWithPath: "/usr/bin/git")
+        let tracked = try await shell.run(
+            executableURL: git,
+            arguments: ["ls-files"],
+            currentDirectoryURL: root
+        )
+        XCTAssertTrue(tracked.standardOutput.contains("notes.txt"))
+        let status = try await shell.run(
+            executableURL: git,
+            arguments: ["status", "--porcelain=v1"],
+            currentDirectoryURL: root
+        )
+        XCTAssertEqual(status.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines), "")
+        let readyInspection = try await manager.inspect(scratch)
+        XCTAssertEqual(readyInspection, .ready(root))
+    }
+
+    func testDotfileOnlyFolderIsInitializableAndCommitsTheDotfile() async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CanvasFoundryDotfile-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        try Data("node_modules/\n".utf8).write(
+            to: scratch.appendingPathComponent(".gitignore")
+        )
+
+        let manager = GitProjectManager()
+        guard case .needsBootstrap(let request) = try await manager.inspect(scratch) else {
+            return XCTFail("A dotfile-only folder should be initializable")
+        }
+        XCTAssertTrue(request.hasExistingFiles)
+
+        let root = try await manager.bootstrap(request)
+        let tracked = try await ShellRunner().run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: ["ls-files"],
+            currentDirectoryURL: root
+        )
+        XCTAssertTrue(tracked.standardOutput.contains(".gitignore"))
+    }
+
+    func testCreateProjectFromScratchIsImmediatelyReadyForAgents() async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CanvasFoundryNewProj-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let projectURL = scratch.appendingPathComponent("Fresh Idea", isDirectory: true)
+
+        let manager = GitProjectManager()
+        let root = try await manager.createProject(at: projectURL)
+        XCTAssertEqual(root.standardizedFileURL.lastPathComponent, "Fresh Idea")
+        let readyInspection = try await manager.inspect(projectURL)
+        XCTAssertEqual(readyInspection, .ready(root))
+
+        // The point of the whole flow: an agent can start immediately.
+        let worktreeManager = GitWorktreeManager(
+            storageRoot: scratch.appendingPathComponent("worktrees", isDirectory: true)
+        )
+        let descriptor = try await worktreeManager.createWorktree(
+            for: root,
+            sessionID: UUID(),
+            title: "Ada Claude"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: descriptor.worktreeURL.path))
+        _ = try await ShellRunner().run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: ["worktree", "remove", "--force", descriptor.worktreeURL.path],
+            currentDirectoryURL: root
+        )
     }
 
     @MainActor

@@ -3,6 +3,10 @@ import Foundation
 struct RepositoryBootstrapRequest: Equatable, Sendable {
     let folderURL: URL
     let shouldInitializeGit: Bool
+    /// Whether the folder already holds files that the initial commit will
+    /// include. Only drives the consent copy — the commit always adds
+    /// everything, so agent worktrees branch from the actual code.
+    var hasExistingFiles: Bool = false
 }
 
 enum ProjectInspection: Equatable, Sendable {
@@ -48,22 +52,27 @@ struct GitProjectManager: Sendable {
             return .needsBootstrap(
                 RepositoryBootstrapRequest(
                     folderURL: rootURL,
-                    shouldInitializeGit: false
+                    shouldInitializeGit: false,
+                    hasExistingFiles: !Self.isEffectivelyEmpty(rootURL)
                 )
             )
         }
 
-        if Self.isEffectivelyEmpty(folderURL) {
-            return .needsBootstrap(
-                RepositoryBootstrapRequest(
-                    folderURL: folderURL,
-                    shouldInitializeGit: true
-                )
+        // Unreadable folders are the only remaining rejection; anything else —
+        // empty, dotfiles-only, or a full codebase — can be initialized with
+        // the user's consent.
+        guard Self.isReadable(folderURL) else {
+            return .unsupported(
+                "Canvas Foundry cannot read this folder. Check its permissions and try again."
             )
         }
 
-        return .unsupported(
-            "Choose an existing Git repository or an empty folder that Canvas Foundry can initialize."
+        return .needsBootstrap(
+            RepositoryBootstrapRequest(
+                folderURL: folderURL,
+                shouldInitializeGit: true,
+                hasExistingFiles: !Self.isEffectivelyEmpty(folderURL)
+            )
         )
     }
 
@@ -84,12 +93,22 @@ struct GitProjectManager: Sendable {
         )
 
         if headResult.exitCode != 0 {
+            // Stage whatever the folder holds before the first commit: agent
+            // worktrees branch from this commit, so an empty one would hand
+            // every agent an empty copy of the project.
+            let addResult = try await shell.run(
+                executableURL: git,
+                arguments: ["add", "-A"],
+                currentDirectoryURL: request.folderURL
+            )
+            try Self.requireSuccess(addResult)
+
             let commitResult = try await shell.run(
                 executableURL: git,
                 arguments: [
                     "-c", "user.name=Canvas Foundry",
                     "-c", "user.email=canvas-foundry@localhost",
-                    "commit", "--allow-empty", "-m", "Initialize repository"
+                    "commit", "--allow-empty", "-m", "Initial commit"
                 ],
                 currentDirectoryURL: request.folderURL
             )
@@ -106,6 +125,30 @@ struct GitProjectManager: Sendable {
         let rootPath = rootResult.standardOutput
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return URL(fileURLWithPath: rootPath, isDirectory: true)
+    }
+
+    /// Creates a brand-new project folder and initializes it in one step, for
+    /// the New Project flow.
+    func createProject(at folderURL: URL) async throws -> URL {
+        try FileManager.default.createDirectory(
+            at: folderURL,
+            withIntermediateDirectories: true
+        )
+        return try await bootstrap(
+            RepositoryBootstrapRequest(
+                folderURL: folderURL,
+                shouldInitializeGit: true,
+                hasExistingFiles: false
+            )
+        )
+    }
+
+    static func isReadable(_ folderURL: URL) -> Bool {
+        (try? FileManager.default.contentsOfDirectory(
+            at: folderURL,
+            includingPropertiesForKeys: nil,
+            options: []
+        )) != nil
     }
 
     static func isEffectivelyEmpty(_ folderURL: URL) -> Bool {
