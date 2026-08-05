@@ -18,11 +18,17 @@ final class CanvasTerminalView: LocalProcessTerminalView {
 
 enum AgentTerminalError: LocalizedError {
     case executableNotFound(String)
+    case processNotRunning(String)
+    case emptyPrompt
 
     var errorDescription: String? {
         switch self {
         case .executableNotFound(let name):
             "Could not find the \(name) CLI. Install it, authenticate it, and relaunch Canvas Foundry."
+        case .processNotRunning(let name):
+            "\(name) isn't running. Relaunch the agent before sending it a prompt."
+        case .emptyPrompt:
+            "The agent prompt is empty."
         }
     }
 }
@@ -66,6 +72,8 @@ final class AgentTerminalRuntime: NSObject, LocalProcessTerminalViewDelegate {
     init(
         session: AgentSession,
         directory: URL,
+        resumeConversation: Bool = false,
+        initialPrompt: String? = nil,
         executableOverride: URL? = nil,
         argumentsOverride: [String]? = nil
     ) throws {
@@ -76,7 +84,13 @@ final class AgentTerminalRuntime: NSObject, LocalProcessTerminalViewDelegate {
         configureTerminal()
         terminalView.processDelegate = self
 
-        let plan = session.provider.launchPlan()
+        let normalizedInitialPrompt = initialPrompt
+            .map(Self.normalizedPrompt)
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let plan = session.provider.launchPlan(
+            resuming: resumeConversation,
+            initialPrompt: normalizedInitialPrompt
+        )
         guard let executableURL = executableOverride ?? ExecutableResolver.resolve(plan.executable) else {
             throw AgentTerminalError.executableNotFound(session.provider.displayName)
         }
@@ -94,14 +108,44 @@ final class AgentTerminalRuntime: NSObject, LocalProcessTerminalViewDelegate {
         terminalView.window?.makeFirstResponder(terminalView)
     }
 
-    func stop(preservingSessionStatus: Bool = false) {
-        guard session?.status.isActive == true else { return }
+    /// Delivers one printable prompt and one Return directly to the agent PTY.
+    /// Control characters are replaced with spaces so voice/text routing cannot
+    /// smuggle terminal escapes, interrupts, or additional submitted commands.
+    func submitPrompt(_ rawPrompt: String) throws {
+        guard terminalView.process.running else {
+            throw AgentTerminalError.processNotRunning(session?.name ?? "This agent")
+        }
+
+        let prompt = Self.normalizedPrompt(rawPrompt)
+        guard !prompt.isEmpty else { throw AgentTerminalError.emptyPrompt }
+
+        var bytes = Array(prompt.utf8)
+        bytes.append(0x0d)
+        terminalView.send(data: bytes[...])
+        focus()
+    }
+
+    nonisolated static func normalizedPrompt(_ rawPrompt: String) -> String {
+        let printableScalars = rawPrompt.unicodeScalars.map { scalar -> Character in
+            let isControl = scalar.value < 0x20 || (scalar.value >= 0x7f && scalar.value <= 0x9f)
+            return isControl ? " " : Character(scalar)
+        }
+        return String(printableScalars)
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @discardableResult
+    func stop(preservingSessionStatus: Bool = false) -> Bool {
+        guard terminalView.process.running else { return false }
         didRequestStop = true
         preservesSessionStatusOnStop = preservingSessionStatus
         if !preservingSessionStatus {
             session?.status = .stopped
         }
         terminalView.terminate()
+        return true
     }
 
     nonisolated func sizeChanged(

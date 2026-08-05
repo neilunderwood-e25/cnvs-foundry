@@ -4,7 +4,6 @@ import SwiftUI
 struct WorkspaceView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = WorkspaceModel()
-    @State private var isReviewQueuePresented = false
     @AppStorage("foundry.agentSidebarVisible") private var isSidebarVisible = true
 
     var body: some View {
@@ -48,9 +47,22 @@ struct WorkspaceView: View {
         .task {
             model.refreshAllGitSummaries()
             model.refreshAllPullRequests()
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: 30_000_000_000)
+                } catch {
+                    break
+                }
+                guard scenePhase == .active else { continue }
+                model.refreshAllGitSummaries()
+                model.refreshAllPullRequests()
+            }
         }
         .onChange(of: scenePhase) { _, newPhase in
-            if newPhase != .active {
+            if newPhase == .active {
+                model.refreshAllGitSummaries()
+                model.refreshAllPullRequests()
+            } else {
                 model.persistWorkspace()
             }
         }
@@ -86,10 +98,10 @@ struct WorkspaceView: View {
                     title: Text("Delete \(request.agentName)?"),
                     message: Text(
                         request.hasUncommittedChanges
-                            ? "This worktree contains uncommitted changes. Deleting it will permanently discard those changes. The Git branch will be kept."
-                            : "This removes the agent card and its worktree. The Git branch and its commits will be kept."
+                            ? "This agent has uncommitted changes. Deleting it will permanently discard those changes."
+                            : "This removes the agent and its isolated workspace. Published work and Git commits are preserved."
                     ),
-                    primaryButton: .destructive(Text("Delete Worktree")) {
+                    primaryButton: .destructive(Text("Delete Agent")) {
                         model.deleteWorktree(request)
                     },
                     secondaryButton: .cancel()
@@ -98,19 +110,10 @@ struct WorkspaceView: View {
                 Alert(
                     title: Text("Switch Projects?"),
                     message: Text(
-                        "This replaces the current canvas containing \(request.existingAgentCount) agent\(request.existingAgentCount == 1 ? "" : "s"). Running agents will stop, but every branch and worktree will remain on disk."
+                        "This replaces the current canvas containing \(request.existingAgentCount) agent\(request.existingAgentCount == 1 ? "" : "s"). Running agents will stop, but their work will remain on disk."
                     ),
                     primaryButton: .destructive(Text("Switch Project")) {
                         model.switchProject(request)
-                    },
-                    secondaryButton: .cancel()
-                )
-            case .publishPullRequest(let request):
-                Alert(
-                    title: Text("Publish \(request.agentName) as a Draft PR?"),
-                    message: Text(pullRequestConfirmationMessage(request)),
-                    primaryButton: .default(Text("Publish Draft PR")) {
-                        model.publishPullRequest(request)
                     },
                     secondaryButton: .cancel()
                 )
@@ -121,12 +124,12 @@ struct WorkspaceView: View {
                 session: session,
                 service: model.gitReviewService,
                 onRepositoryChanged: model.refreshAllGitSummaries,
-                onPreparePullRequest: {
-                    model.reviewingSession = nil
-                    model.preparePullRequest(session)
-                },
+                onPublishPullRequest: { model.shipPullRequest(session) },
                 onOpenPullRequest: { model.openPullRequest(session) },
                 onPushPullRequestUpdates: { model.pushPullRequestUpdates(session) },
+                onMarkPullRequestReady: { model.markPullRequestReady(session) },
+                onSyncPullRequest: { model.syncPullRequestWithBase(session) },
+                onMergePullRequest: { model.squashMergePullRequest(session) },
                 onRefreshPullRequest: { model.refreshPullRequest(session) },
                 onDelete: { model.prepareWorktreeDeletion(session) }
             )
@@ -142,9 +145,6 @@ struct WorkspaceView: View {
                 maxHeight: .infinity
             )
         }
-        .sheet(isPresented: $isReviewQueuePresented) {
-            PullRequestReviewQueueView(model: model)
-        }
     }
 
     private func bootstrapConfirmationMessage(_ request: RepositoryBootstrapRequest) -> String {
@@ -152,11 +152,11 @@ struct WorkspaceView: View {
         case (true, true):
             "This folder isn't a Git repository yet. Canvas Foundry will run git init and commit the existing files as “Initial commit”, so agents branch from your code."
         case (true, false):
-            "Canvas Foundry will initialize this empty folder locally and create the first commit required for isolated worktrees."
+            "Canvas Foundry will initialize this empty folder locally and create the first commit required for isolated agents."
         case (false, true):
-            "This repository has no commits. Canvas Foundry will commit the existing files as “Initial commit” so agents can use isolated worktrees."
+            "This repository has no commits. Canvas Foundry will commit the existing files as “Initial commit” so agents can work independently."
         case (false, false):
-            "This repository has no commits. Canvas Foundry can create an empty initial commit so agents can use isolated worktrees."
+            "This repository has no commits. Canvas Foundry can create an empty initial commit so agents can work independently."
         }
     }
 
@@ -166,22 +166,6 @@ struct WorkspaceView: View {
         case (true, false): "Initialize Locally"
         case (false, _): "Create Commit"
         }
-    }
-
-    private func pullRequestConfirmationMessage(
-        _ request: PullRequestPublishRequest
-    ) -> String {
-        var lines = [
-            "“\(request.suggestedTitle)”",
-            "\(request.commitCount) commit\(request.commitCount == 1 ? "" : "s") will be pushed to origin and opened against \(request.baseBranch)."
-        ]
-        if request.hasUncommittedChanges {
-            lines.append("Warning: uncommitted worktree changes will not be included.")
-        }
-        if request.testStatus != .passed {
-            lines.append("Warning: tests are currently \(request.testStatus.label.lowercased()).")
-        }
-        return lines.joined(separator: "\n\n")
     }
 
     @ToolbarContentBuilder
@@ -205,18 +189,6 @@ struct WorkspaceView: View {
 
         if model.projectURL != nil {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    isReviewQueuePresented = true
-                } label: {
-                    Label(
-                        model.openPullRequestCount == 0
-                            ? "Review Queue"
-                            : "Review Queue, \(model.openPullRequestCount) open",
-                        systemImage: "arrow.triangle.pull"
-                    )
-                }
-                .help("Open review queue")
-
                 IDELaunchToolbarMenu(model: model)
 
                 Menu {
@@ -249,28 +221,16 @@ private struct IDELaunchToolbarMenu: View {
                 Text("No supported IDE is installed")
             }
             ForEach(installedIDEs) { ide in
-                Section(ide.buttonTitle) {
-                    Button {
-                        model.openProject(in: ide)
-                    } label: {
-                        Label("Open Main Project", systemImage: "folder")
-                    }
-                    if !model.availableIDEWorktreeSessions.isEmpty {
-                        Button {
-                            model.openAllActiveWorktrees(in: ide)
-                        } label: {
-                            Label(
-                                "Open Main + \(model.availableIDEWorktreeSessions.count) Agent Worktree\(model.availableIDEWorktreeSessions.count == 1 ? "" : "s")",
-                                systemImage: "square.3.layers.3d"
-                            )
-                        }
-                    }
+                Button {
+                    model.openProject(in: ide)
+                } label: {
+                    Label("Open in \(ide.shortDisplayName)", systemImage: "folder")
                 }
             }
         } label: {
             Label("Open in IDE", systemImage: "chevron.left.forwardslash.chevron.right")
         }
-        .help("Open project or worktrees in an IDE")
+        .help("Open the project in an IDE")
     }
 
     private var installedIDEs: [ProjectIDE] {
@@ -287,7 +247,7 @@ private struct EmptyWorkspaceView: View {
             FoundryMarkView(size: 56)
             Text("Your agents need a place to build")
                 .font(.foundry(size: 24, weight: .semibold))
-            Text("Open any folder — Git repos open directly, everything else can be initialized in one step. Every CLI agent gets its own branch and worktree.")
+            Text("Open any folder—Git projects open directly, and other folders can be initialized in one step. Every CLI agent works independently.")
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 510)

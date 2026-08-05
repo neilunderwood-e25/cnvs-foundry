@@ -9,9 +9,6 @@ struct AgentCardView: View {
     let onArchive: () -> Void
     let onDelete: () -> Void
     let onOpenInIDE: (ProjectIDE) -> Void
-    let onPreparePullRequest: () -> Void
-    let onOpenPullRequest: () -> Void
-    let onPushPullRequestUpdates: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -66,48 +63,39 @@ struct AgentCardView: View {
                         session.runtime?.stop()
                     }
                 } else if session.worktree != nil {
-                    Button("Relaunch Agent") {
+                    Button("Resume Agent") {
                         onRelaunch()
                     }
                 }
                 if let worktree = session.worktree {
-                    Button("Review Git Changes") {
+                    Button("Review & Ship") {
                         onReview()
                     }
-                    if session.isPublishingPullRequest {
-                        Button("Updating Pull Request…") {}
-                            .disabled(true)
-                    } else if let pullRequest = session.pullRequest {
-                        Button("Open \(pullRequest.displayLabel)", action: onOpenPullRequest)
-                        if pullRequest.state == .open {
-                            Button("Push PR Updates", action: onPushPullRequestUpdates)
-                        }
-                    } else {
-                        Button("Publish Draft PR", action: onPreparePullRequest)
-                    }
                     ForEach(installedIDEs) { ide in
-                        Button("Open \(session.name) Worktree in \(ide.shortDisplayName)") {
+                        Button("Open Agent in \(ide.shortDisplayName)") {
                             onOpenInIDE(ide)
                         }
                     }
-                    Button("Reveal Worktree in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([worktree.worktreeURL])
-                    }
-                    Button("Open in Terminal") {
-                        let terminal = URL(
-                            fileURLWithPath: "/System/Applications/Utilities/Terminal.app",
-                            isDirectory: true
-                        )
-                        NSWorkspace.shared.open(
-                            [worktree.worktreeURL],
-                            withApplicationAt: terminal,
-                            configuration: NSWorkspace.OpenConfiguration()
-                        )
+                    Menu("Advanced") {
+                        Button("Reveal Workspace in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([worktree.worktreeURL])
+                        }
+                        Button("Open Workspace in Terminal") {
+                            let terminal = URL(
+                                fileURLWithPath: "/System/Applications/Utilities/Terminal.app",
+                                isDirectory: true
+                            )
+                            NSWorkspace.shared.open(
+                                [worktree.worktreeURL],
+                                withApplicationAt: terminal,
+                                configuration: NSWorkspace.OpenConfiguration()
+                            )
+                        }
+                        Button("Archive Agent", action: onArchive)
                     }
                 }
                 Divider()
-                Button("Archive Agent", action: onArchive)
-                Button("Delete Agent and Worktree", role: .destructive, action: onDelete)
+                Button("Delete Agent", role: .destructive, action: onDelete)
                     .disabled(session.worktree == nil)
             } label: {
                 Image(systemName: "ellipsis")
@@ -141,15 +129,15 @@ struct AgentCardView: View {
                             Image(systemName: "terminal")
                                 .font(.system(size: 24, weight: .light))
                                 .foregroundStyle(accentColor)
-                            Text("Ready to relaunch in the existing worktree")
+                            Text("Ready to continue in the existing workspace")
                                 .foregroundStyle(.secondary)
-                            Button("Relaunch \(session.name)", action: onRelaunch)
+                            Button("Resume \(session.name)", action: onRelaunch)
                                 .buttonStyle(.borderedProminent)
                                 .tint(accentColor)
                         case .preparing, .working, .needsYou:
                             ProgressView()
                                 .controlSize(.small)
-                            Text("Creating isolated worktree…")
+                            Text("Preparing an isolated workspace…")
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -163,29 +151,18 @@ struct AgentCardView: View {
 
     private var footer: some View {
         HStack(spacing: 8) {
-            Image(systemName: "arrow.triangle.branch")
-            Text(session.worktree?.branchName ?? "allocating worktree")
+            Image(systemName: deliverySymbol)
+            Text(session.deliveryState.label)
                 .lineLimit(1)
             Spacer()
-            if let pullRequest = session.pullRequest {
-                Button(action: onOpenPullRequest) {
-                    Text(pullRequest.queueState.label.uppercased())
-                        .font(.foundry(size: 9, weight: .bold))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(pullRequestBadgeColor(pullRequest.queueState))
-                .help("Open pull request")
-            }
-            if session.gitSummary.changedFileCount > 0 {
+            if session.canReviewAndShip {
                 Button(action: onReview) {
-                    Label(
-                        "\(session.gitSummary.changedFileCount)",
-                        systemImage: "doc.badge.ellipsis"
-                    )
+                    Text("Review & Ship")
+                        .font(.foundry(size: 9, weight: .semibold))
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.orange)
-                .help("Review changed files")
+                .foregroundStyle(deliveryColor)
+                .help("Review changes and deliver this agent's work")
             }
             if session.status.isActive {
                 Button {
@@ -202,7 +179,7 @@ struct AgentCardView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
-                .help("Relaunch agent")
+                .help("Resume this agent and its conversation")
             }
         }
         .font(.system(size: 9.5, weight: .medium, design: .monospaced))
@@ -212,21 +189,12 @@ struct AgentCardView: View {
         .frame(height: 27)
     }
 
-    private func pullRequestBadgeColor(_ state: PullRequestQueueState) -> Color {
-        switch state {
-        case .readyToMerge, .merged: .green
-        case .checksFailed, .changesRequested, .conflict: .red
-        case .draft, .checksPending, .reviewRequired, .behind: .orange
-        case .blocked, .closed: .secondary
-        }
-    }
-
     private var statusBadge: some View {
         HStack(spacing: 5) {
             Circle()
                 .fill(statusColor)
                 .frame(width: 6, height: 6)
-            Text(session.status.label)
+            Text(session.deliveryState.label)
         }
         .font(.foundry(size: 9, weight: .semibold))
         .foregroundStyle(statusColor)
@@ -263,13 +231,33 @@ struct AgentCardView: View {
     }
 
     private var statusColor: Color {
-        switch session.status {
-        case .preparing: .yellow
-        case .working: .green
-        case .completed: .cyan
-        case .needsYou: .orange
-        case .stopped: .secondary
-        case .failed: .red
+        deliveryColor
+    }
+
+    private var deliveryColor: Color {
+        switch session.deliveryState {
+        case .readyToMerge, .completed: .green
+        case .needsAttention: .red
+        case .changesReady, .readyToPublish, .draftPullRequest, .checksRunning: .orange
+        case .preparing, .publishing: .yellow
+        case .working: .cyan
+        case .idle: .secondary
+        }
+    }
+
+    private var deliverySymbol: String {
+        switch session.deliveryState {
+        case .preparing: "gearshape.2"
+        case .working: "bolt.fill"
+        case .changesReady: "doc.badge.ellipsis"
+        case .readyToPublish: "arrow.up.circle.fill"
+        case .publishing: "arrow.triangle.2.circlepath"
+        case .draftPullRequest: "doc.text"
+        case .checksRunning: "clock.fill"
+        case .readyToMerge: "checkmark.circle.fill"
+        case .needsAttention: "exclamationmark.triangle.fill"
+        case .completed: "checkmark.seal.fill"
+        case .idle: "pause.circle"
         }
     }
 

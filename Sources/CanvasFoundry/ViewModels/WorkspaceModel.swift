@@ -49,7 +49,6 @@ enum WorkspaceAlertState: Identifiable, Equatable {
     case bootstrap(RepositoryBootstrapRequest)
     case deleteWorktree(WorktreeDeletionRequest)
     case switchProject(ProjectSwitchRequest)
-    case publishPullRequest(PullRequestPublishRequest)
 
     var id: String {
         switch self {
@@ -61,8 +60,6 @@ enum WorkspaceAlertState: Identifiable, Equatable {
             "delete-worktree-\(request.sessionID)-\(request.hasUncommittedChanges)"
         case .switchProject(let request):
             "switch-project-\(request.projectURL.path)"
-        case .publishPullRequest(let request):
-            "publish-pr-\(request.sessionID)-\(request.commitCount)-\(request.hasUncommittedChanges)"
         }
     }
 }
@@ -78,22 +75,13 @@ struct ProjectSwitchRequest: Equatable {
     let existingAgentCount: Int
 }
 
-struct PullRequestPublishRequest: Equatable {
-    let sessionID: UUID
-    let agentName: String
-    let commitCount: Int
-    let hasUncommittedChanges: Bool
-    let baseBranch: String
-    let suggestedTitle: String
-    let testStatus: AgentTestStatus
-}
-
 @MainActor
 final class WorkspaceModel: ObservableObject {
     @Published var projectURL: URL? {
         didSet {
             if let projectURL, !isRestoring {
                 rememberProject(projectURL)
+                warmLocalPlanner()
             }
             schedulePersistence()
         }
@@ -122,22 +110,28 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var selectedAnnotationIDs: Set<UUID> = []
     @Published var alertState: WorkspaceAlertState?
     @Published var reviewingSession: AgentSession?
-    @Published var reviewQueueNotice: String?
     @Published private(set) var mergingSessionID: UUID?
     @Published private(set) var recentProjectURLs: [URL] = []
+    @Published private(set) var isLocalPlannerWarm = false
+    @Published private(set) var lastLocalPlannerMetrics: LocalPlannerMetrics?
+    @Published var pendingConversationConfirmation: WorkspaceConversationConfirmation?
+    @Published private(set) var recentConversation: [LocalFoundryConversationTurn] = []
 
     private let worktreeManager: GitWorktreeManager
     private let projectManager: GitProjectManager
     private let persistence: WorkspacePersistence
     let gitReviewService: GitReviewService
     private let pullRequestService: GitHubPullRequestService
+    private let localActionPlanner: LocalActionPlanner
     private var viewportSize = CGSize(width: 1200, height: 760)
     private var sessionObservers: [UUID: AnyCancellable] = [:]
     private var persistenceTask: Task<Void, Never>?
+    private var localPlannerWarmupTask: Task<Void, Never>?
     private var isRestoring = true
     /// Snapshots of `annotations` taken before each edit, newest last.
     private var annotationHistory: [[CanvasAnnotation]] = []
     private static let annotationHistoryLimit = 60
+    private static let conversationHistoryLimit = 4
     /// Positions captured when a move begins, so every frame of the drag is
     /// applied to the original geometry instead of compounding deltas.
     private var selectionDragOrigin: [UUID: [CGPoint]] = [:]
@@ -147,16 +141,19 @@ final class WorkspaceModel: ObservableObject {
         projectManager: GitProjectManager = GitProjectManager(),
         persistence: WorkspacePersistence = WorkspacePersistence(),
         gitReviewService: GitReviewService = GitReviewService(),
-        pullRequestService: GitHubPullRequestService = GitHubPullRequestService()
+        pullRequestService: GitHubPullRequestService = GitHubPullRequestService(),
+        localActionPlanner: LocalActionPlanner = LocalActionPlanner()
     ) {
         self.worktreeManager = worktreeManager
         self.projectManager = projectManager
         self.persistence = persistence
         self.gitReviewService = gitReviewService
         self.pullRequestService = pullRequestService
+        self.localActionPlanner = localActionPlanner
         restoreWorkspace()
         isRestoring = false
         observeSessions()
+        if projectURL != nil { warmLocalPlanner() }
     }
 
     var activeAgentCount: Int {
@@ -165,28 +162,6 @@ final class WorkspaceModel: ObservableObject {
 
     var visibleSessions: [AgentSession] {
         sessions.filter { !$0.isArchived }
-    }
-
-    var availableIDEWorktreeSessions: [AgentSession] {
-        visibleSessions.filter { session in
-            guard let path = session.worktree?.worktreeURL.path else { return false }
-            return FileManager.default.fileExists(atPath: path)
-        }
-    }
-
-    var reviewQueueSessions: [AgentSession] {
-        sessions
-            .filter { $0.pullRequest != nil }
-            .sorted { lhs, rhs in
-                let lhsOpen = lhs.pullRequest?.state == .open
-                let rhsOpen = rhs.pullRequest?.state == .open
-                if lhsOpen != rhsOpen { return lhsOpen }
-                return lhs.createdAt < rhs.createdAt
-            }
-    }
-
-    var openPullRequestCount: Int {
-        sessions.filter { $0.pullRequest?.state == .open }.count
     }
 
     func chooseProject() {
@@ -261,24 +236,43 @@ final class WorkspaceModel: ObservableObject {
     /// placement engine sees each previous one, but the worktrees are attached
     /// one at a time: `GitWorktreeManager` is a plain struct, so several
     /// concurrent `git worktree add` calls would contend on the same repository.
-    func createAgents(provider: AgentProvider, count: Int) {
+    @discardableResult
+    func createAgents(provider: AgentProvider, count: Int) -> Bool {
+        createAgents(provider: provider, count: count, initialPrompt: nil)
+    }
+
+    @discardableResult
+    func createAgent(provider: AgentProvider, initialPrompt: String) -> Bool {
+        createAgents(provider: provider, count: 1, initialPrompt: initialPrompt)
+    }
+
+    private func createAgents(
+        provider: AgentProvider,
+        count: Int,
+        initialPrompt: String?
+    ) -> Bool {
         guard let projectURL else {
             alertState = .message("Choose a Git project before launching an agent.")
-            return
+            return false
         }
         guard ExecutableResolver.resolve(provider.launchPlan().executable) != nil else {
             alertState = .message(
                 AgentTerminalError.executableNotFound(provider.displayName).localizedDescription
             )
-            return
+            return false
         }
 
         let staged = (0..<max(1, count)).map { _ in stageSession(provider: provider) }
         Task {
             for session in staged {
-                await activateSession(session, projectURL: projectURL)
+                await activateSession(
+                    session,
+                    projectURL: projectURL,
+                    initialPrompt: initialPrompt
+                )
             }
         }
+        return true
     }
 
     private func stageSession(provider: AgentProvider) -> AgentSession {
@@ -313,18 +307,26 @@ final class WorkspaceModel: ObservableObject {
         return session
     }
 
-    private func activateSession(_ session: AgentSession, projectURL: URL) async {
+    private func activateSession(
+        _ session: AgentSession,
+        projectURL: URL,
+        initialPrompt: String? = nil
+    ) async {
         do {
+            let normalizedPrompt = initialPrompt.map(AgentTerminalRuntime.normalizedPrompt)
+            let worktreeTitle = normalizedPrompt.flatMap { $0.isEmpty ? nil : $0 }
+                ?? "\(session.name)-\(session.provider.rawValue)"
             let descriptor = try await worktreeManager.createWorktree(
                 for: projectURL,
                 sessionID: session.id,
-                title: "\(session.name)-\(session.provider.rawValue)"
+                title: worktreeTitle
             )
             session.worktree = descriptor
 
             let runtime = try AgentTerminalRuntime(
                 session: session,
-                directory: descriptor.worktreeURL
+                directory: descriptor.worktreeURL,
+                initialPrompt: normalizedPrompt
             )
             session.runtime = runtime
             refreshGitSummary(session)
@@ -359,88 +361,24 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
-    func openAllActiveWorktrees(in ide: ProjectIDE) {
-        guard let projectURL else { return }
-        // In-repo worktrees come along with the project folder for free; only
-        // legacy ones created outside the repository need their own root.
-        let externalFolders = availableIDEWorktreeSessions.compactMap {
-            session -> IDEProjectOpener.WorkspaceFolder? in
-            guard let worktreeURL = session.worktree?.worktreeURL,
-                  !IDEProjectOpener.isInside(worktreeURL, of: projectURL) else {
-                return nil
-            }
-            return IDEProjectOpener.WorkspaceFolder(
-                name: "\(session.name) — \(session.provider.shortName)",
-                url: worktreeURL
-            )
-        }
-
-        Task {
-            do {
-                ensureEditorSeesWorktrees(projectURL)
-                guard !externalFolders.isEmpty else {
-                    try await IDEProjectOpener.open(projectURL: projectURL, in: ide)
-                    return
-                }
-                let folders = [
-                    IDEProjectOpener.WorkspaceFolder(
-                        name: "Main — \(projectURL.lastPathComponent)",
-                        url: projectURL
-                    )
-                ] + externalFolders
-                let workspaceURL = try IDEProjectOpener.makeMultiRootWorkspace(
-                    projectURL: projectURL,
-                    folders: folders
-                )
-                try await IDEProjectOpener.open(projectURL: workspaceURL, in: ide)
-            } catch {
-                alertState = .message(error.localizedDescription)
-            }
-        }
-    }
-
     func openAgentWorktree(_ session: AgentSession, in ide: ProjectIDE) {
         guard let descriptor = session.worktree else { return }
         Task {
             do {
-                // Worktrees now live inside the project, so opening the project
-                // folder alone shows the codebase with the agent's branch in it.
-                if IDEProjectOpener.isInside(
-                    descriptor.worktreeURL,
-                    of: descriptor.projectRoot
-                ) {
-                    ensureEditorSeesWorktrees(descriptor.projectRoot)
-                    try await IDEProjectOpener.open(
-                        projectURL: descriptor.projectRoot,
-                        in: ide
-                    )
-                    return
-                }
-
-                // Legacy worktrees created outside the repository still need the
-                // two-root workspace to appear alongside the project.
-                let workspaceURL = try IDEProjectOpener.makeMultiRootWorkspace(
-                    projectURL: descriptor.projectRoot,
-                    folders: [
-                        .init(
-                            name: "Main — \(descriptor.projectRoot.lastPathComponent)",
-                            url: descriptor.projectRoot
-                        ),
-                        .init(
-                            name: "\(session.name) — \(session.provider.shortName)",
-                            url: descriptor.worktreeURL
-                        )
-                    ],
-                    variant: String(session.id.uuidString.lowercased().prefix(8))
+                try await IDEProjectOpener.open(
+                    projectURL: descriptor.worktreeURL,
+                    in: ide
                 )
-                try await IDEProjectOpener.open(projectURL: workspaceURL, in: ide)
             } catch {
                 alertState = .message(error.localizedDescription)
             }
         }
     }
 
-    func preparePullRequest(_ session: AgentSession) {
+    /// Publishes the reviewed branch without exposing the push/preflight steps
+    /// as separate product actions. A branch with an existing PR is simply
+    /// reconciled back into the agent state.
+    func shipPullRequest(_ session: AgentSession) {
         guard let descriptor = session.worktree,
               !session.isPublishingPullRequest else {
             return
@@ -452,46 +390,18 @@ final class WorkspaceModel: ObservableObject {
                 let preflight = try await pullRequestService.preflight(descriptor)
                 if let existing = preflight.existingPullRequest {
                     session.pullRequest = existing
-                    openPullRequest(session)
                     return
                 }
-                alertState = .publishPullRequest(
-                    PullRequestPublishRequest(
-                        sessionID: session.id,
-                        agentName: session.name,
-                        commitCount: preflight.commitCount,
-                        hasUncommittedChanges: preflight.hasUncommittedChanges,
-                        baseBranch: preflight.baseBranch,
-                        suggestedTitle: preflight.suggestedTitle,
-                        testStatus: session.testStatus
+                guard !preflight.hasUncommittedChanges else {
+                    alertState = .message(
+                        "Review and commit \(session.name)’s remaining changes before creating the pull request."
                     )
-                )
-            } catch {
-                alertState = .message(error.localizedDescription)
-            }
-        }
-    }
-
-    func publishPullRequest(_ request: PullRequestPublishRequest) {
-        alertState = nil
-        guard let session = sessions.first(where: { $0.id == request.sessionID }),
-              let descriptor = session.worktree,
-              !session.isPublishingPullRequest else {
-            return
-        }
-        session.isPublishingPullRequest = true
-        Task {
-            defer { session.isPublishingPullRequest = false }
-            do {
-                let pullRequest = try await pullRequestService.publishDraft(
+                    return
+                }
+                session.pullRequest = try await pullRequestService.publishDraft(
                     descriptor,
                     agentName: session.name,
                     testStatus: session.testStatus
-                )
-                session.pullRequest = pullRequest
-                NSWorkspace.shared.open(pullRequest.url)
-                alertState = .message(
-                    "Published draft PR #\(pullRequest.number) against \(pullRequest.baseBranch)."
                 )
             } catch {
                 alertState = .message(error.localizedDescription)
@@ -543,7 +453,7 @@ final class WorkspaceModel: ObservableObject {
                 }
             } catch {
                 if reportErrors {
-                    reviewQueueNotice = error.localizedDescription
+                    alertState = .message(error.localizedDescription)
                 }
             }
         }
@@ -560,15 +470,13 @@ final class WorkspaceModel: ObservableObject {
               !session.isPublishingPullRequest else {
             return
         }
-        reviewQueueNotice = nil
         session.isPublishingPullRequest = true
         Task {
             defer { session.isPublishingPullRequest = false }
             do {
                 session.pullRequest = try await pullRequestService.markReady(descriptor)
-                reviewQueueNotice = "PR #\(session.pullRequest?.number ?? 0) is ready for review."
             } catch {
-                reviewQueueNotice = error.localizedDescription
+                alertState = .message(error.localizedDescription)
             }
         }
     }
@@ -578,16 +486,14 @@ final class WorkspaceModel: ObservableObject {
               !session.isPublishingPullRequest else {
             return
         }
-        reviewQueueNotice = nil
         session.isPublishingPullRequest = true
         Task {
             defer { session.isPublishingPullRequest = false }
             do {
                 session.pullRequest = try await pullRequestService.syncWithBase(descriptor)
                 refreshGitSummary(session)
-                reviewQueueNotice = "Synced \(session.name) with \(session.pullRequest?.baseBranch ?? "the base branch")."
             } catch {
-                reviewQueueNotice = error.localizedDescription
+                alertState = .message(error.localizedDescription)
             }
         }
     }
@@ -598,7 +504,6 @@ final class WorkspaceModel: ObservableObject {
               session.pullRequest?.isReadyToMerge == true else {
             return
         }
-        reviewQueueNotice = nil
         mergingSessionID = session.id
         session.isPublishingPullRequest = true
         Task {
@@ -610,7 +515,9 @@ final class WorkspaceModel: ObservableObject {
                 let merged = try await pullRequestService.squashMerge(descriptor)
                 session.pullRequest = merged
                 guard merged.state == .merged else {
-                    reviewQueueNotice = "GitHub accepted PR #\(merged.number) for merging, but it is still open. The agent and worktree were preserved while GitHub finishes its merge queue."
+                    alertState = .message(
+                        "GitHub accepted PR #\(merged.number) for its merge queue. The agent will remain available until GitHub finishes."
+                    )
                     return
                 }
                 await cleanUpMergedSession(session)
@@ -620,7 +527,7 @@ final class WorkspaceModel: ObservableObject {
                     refreshPullRequest(candidate)
                 }
             } catch {
-                reviewQueueNotice = error.localizedDescription
+                alertState = .message(error.localizedDescription)
             }
         }
     }
@@ -642,7 +549,9 @@ final class WorkspaceModel: ObservableObject {
         let hasChanges = (try? await worktreeManager.hasUncommittedChanges(descriptor)) ?? true
         guard !hasChanges else {
             session.status = .needsYou("PR merged; uncommitted work remains")
-            reviewQueueNotice = "Merged PR #\(pullRequest.number). \(session.name)’s worktree was preserved because it still has uncommitted changes."
+            alertState = .message(
+                "PR #\(pullRequest.number) merged, but \(session.name) still has local changes. The agent was preserved so nothing is lost."
+            )
             return
         }
 
@@ -653,38 +562,49 @@ final class WorkspaceModel: ObservableObject {
             if selectedSessionID == session.id {
                 select(nil)
             }
-            reviewQueueNotice = "Merged PR #\(pullRequest.number): archived \(session.name) and removed the worktree. The Git branch was preserved."
+            if reviewingSession?.id == session.id {
+                reviewingSession = nil
+            }
         } catch {
             session.status = .completed
-            reviewQueueNotice = "Merged PR #\(pullRequest.number), but the worktree could not be removed: \(error.localizedDescription)"
+            alertState = .message(
+                "PR #\(pullRequest.number) merged, but the agent workspace could not be cleaned up: \(error.localizedDescription)"
+            )
         }
     }
 
-    func relaunch(_ session: AgentSession) {
-        guard !session.status.isActive else { return }
+    @discardableResult
+    func relaunch(_ session: AgentSession) -> Bool {
+        guard session.runtime?.terminalView.process.running != true else {
+            alertState = .message("\(session.name) is already running.")
+            return false
+        }
         guard let descriptor = session.worktree else {
-            session.status = .failed("This agent does not have an assigned worktree.")
-            return
+            session.status = .failed("This agent does not have an isolated workspace.")
+            return false
         }
         guard FileManager.default.fileExists(atPath: descriptor.worktreeURL.path) else {
-            session.status = .failed("The agent worktree no longer exists on disk.")
-            return
+            session.status = .failed("The agent workspace no longer exists on disk.")
+            return false
         }
         guard ExecutableResolver.resolve(session.provider.launchPlan().executable) != nil else {
             session.status = .failed(
                 AgentTerminalError.executableNotFound(session.provider.displayName).localizedDescription
             )
-            return
+            return false
         }
 
         do {
             session.runtime = try AgentTerminalRuntime(
                 session: session,
-                directory: descriptor.worktreeURL
+                directory: descriptor.worktreeURL,
+                resumeConversation: true
             )
             select(session)
+            return true
         } catch {
             session.status = .failed(error.localizedDescription)
+            return false
         }
     }
 
@@ -714,35 +634,361 @@ final class WorkspaceModel: ObservableObject {
 
     // MARK: - Command bar
 
+    func planLocalActions(for input: String) async throws -> LocalFoundryActionPlan {
+        var handleToSessionID: [String: UUID] = [:]
+        let allAgents = sessions.enumerated().map { index, session in
+            let handle = "agent_\(index + 1)"
+            handleToSessionID[handle] = session.id
+            return LocalFoundryAgentContext(
+                id: handle,
+                name: session.name,
+                provider: session.provider.rawValue,
+                status: session.status.label,
+                isRunning: session.runtime?.terminalView.process.running == true,
+                isArchived: session.isArchived,
+                changedFileCount: session.gitSummary.changedFileCount,
+                commitCount: session.gitSummary.commitCount,
+                pullRequestNumber: session.pullRequest?.number
+            )
+        }
+        let selectedHandle = handleToSessionID.first { $0.value == selectedSessionID }?.key
+        let relevantAgents = LocalFoundryContextFilter.agents(
+            for: input,
+            selectedAgentID: selectedHandle,
+            from: allAgents
+        )
+        let context = LocalFoundryWorkspaceContext(
+            projectName: projectURL?.lastPathComponent,
+            selectedAgentID: selectedHandle,
+            agents: relevantAgents,
+            recentConversation: recentConversation
+        )
+        let result = try await localActionPlanner.planWithMetrics(input: input, context: context)
+        lastLocalPlannerMetrics = result.metrics
+        isLocalPlannerWarm = true
+        var resolvedPlan = result.plan
+        for index in resolvedPlan.actions.indices {
+            guard let handle = resolvedPlan.actions[index].agentID,
+                  let sessionID = handleToSessionID[handle] else { continue }
+            resolvedPlan.actions[index].agentID = sessionID.uuidString
+        }
+        return resolvedPlan
+    }
+
+    private func warmLocalPlanner() {
+        guard localPlannerWarmupTask == nil else { return }
+        localPlannerWarmupTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.localPlannerWarmupTask = nil }
+            do {
+                try await self.localActionPlanner.warmUp()
+                self.isLocalPlannerWarm = true
+            } catch {
+                self.isLocalPlannerWarm = false
+            }
+        }
+    }
+
+    /// Validates every model-proposed capability against current workspace
+    /// state immediately before execution. Invalid IDs and malformed arguments
+    /// are ignored rather than guessed.
+    @discardableResult
+    func run(_ plan: LocalFoundryActionPlan) -> LocalFoundryActionExecution {
+        var acknowledgements: [String] = []
+        var didPrepareRemoval = false
+        var createdAgentCount = 0
+
+        for action in plan.actions {
+            switch action.type {
+            case .createAgent:
+                guard let providerName = action.provider?.lowercased(),
+                      let provider = AgentProvider(rawValue: providerName) else { continue }
+                let count = action.count ?? 1
+                guard (1...WorkspaceCommandParser.maximumAgentsPerCommand).contains(count) else {
+                    continue
+                }
+                guard createdAgentCount + count <= WorkspaceCommandParser.maximumAgentsPerCommand else {
+                    continue
+                }
+                let prompt = action.prompt?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let prompt, !prompt.isEmpty {
+                    guard count == 1, createAgent(provider: provider, initialPrompt: prompt) else {
+                        continue
+                    }
+                } else if !createAgents(provider: provider, count: count) {
+                    continue
+                }
+                createdAgentCount += count
+                acknowledgements.append(
+                    "Opening \(count == 1 ? "one" : String(count)) \(provider.shortName) agent\(count == 1 ? "" : "s") now."
+                )
+
+            case .sendPrompt:
+                guard let session = session(withModelID: action.agentID),
+                      let prompt = action.prompt?
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                      !prompt.isEmpty,
+                      run(.sendPrompt(name: session.name, prompt: prompt)) else { continue }
+                acknowledgements.append("Sending that to \(session.name).")
+
+            case .focusAgent:
+                guard let session = session(withModelID: action.agentID) else { continue }
+                revealTerminal(session)
+                acknowledgements.append("Bringing \(session.name) into view.")
+
+            case .stopAgent:
+                guard let session = session(withModelID: action.agentID),
+                      run(.stopAgent(name: session.name)) else { continue }
+                acknowledgements.append("Stopping \(session.name) now.")
+
+            case .resumeAgent:
+                guard let session = session(withModelID: action.agentID),
+                      run(.resumeAgent(name: session.name)) else { continue }
+                acknowledgements.append("Resuming \(session.name) now.")
+
+            case .prepareRemoveAgent:
+                guard !didPrepareRemoval,
+                      let session = session(withModelID: action.agentID) else { continue }
+                didPrepareRemoval = true
+                prepareConversationRemoval(session)
+                acknowledgements.append("Checking \(session.name)’s workspace before removal.")
+
+            case .noAction:
+                continue
+            }
+        }
+
+        let modelResponse = String(
+            plan.response
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .prefix(200)
+        )
+        let isInformational = plan.actions.isEmpty
+            || plan.actions.allSatisfy { $0.type == .noAction }
+        let message = acknowledgements.isEmpty && isInformational
+            ? modelResponse
+            : acknowledgements.joined(separator: " ")
+        return LocalFoundryActionExecution(
+            wasHandled: !acknowledgements.isEmpty || (isInformational && !modelResponse.isEmpty),
+            message: message
+        )
+    }
+
+    private func session(withModelID value: String?) -> AgentSession? {
+        guard let value, let id = UUID(uuidString: value) else { return nil }
+        return sessions.first { $0.id == id }
+    }
+
+    func runConversationControl(
+        _ control: WorkspaceConversationControl
+    ) -> LocalFoundryActionExecution {
+        switch control {
+        case .confirm, .doThat:
+            guard let pending = pendingConversationConfirmation else {
+                return LocalFoundryActionExecution(
+                    wasHandled: true,
+                    message: "There’s nothing waiting for confirmation."
+                )
+            }
+            pendingConversationConfirmation = nil
+            switch pending.action {
+            case .removeAgent(let request):
+                deleteWorktree(request)
+                return LocalFoundryActionExecution(
+                    wasHandled: true,
+                    message: "Removing \(request.agentName) now."
+                )
+            }
+
+        case .cancel:
+            guard pendingConversationConfirmation != nil else {
+                return LocalFoundryActionExecution(
+                    wasHandled: true,
+                    message: "There’s nothing waiting to cancel."
+                )
+            }
+            pendingConversationConfirmation = nil
+            return LocalFoundryActionExecution(
+                wasHandled: true,
+                message: "Cancelled. Nothing was changed."
+            )
+        }
+    }
+
+    func rememberConversation(
+        userRequest: String,
+        assistantResult: String,
+        referencedAgentIDs: [String],
+        didExecuteAction: Bool
+    ) {
+        let referencedNames = referencedAgentIDs.compactMap { value -> String? in
+            guard let id = UUID(uuidString: value) else { return nil }
+            return sessions.first(where: { $0.id == id })?.name
+        }
+        recentConversation.append(
+            LocalFoundryConversationTurn(
+                userRequest: String(userRequest.prefix(500)),
+                assistantResult: String(assistantResult.prefix(300)),
+                referencedAgentNames: Array(Set(referencedNames)).sorted(),
+                didExecuteAction: didExecuteAction
+            )
+        )
+        if recentConversation.count > Self.conversationHistoryLimit {
+            recentConversation.removeFirst(
+                recentConversation.count - Self.conversationHistoryLimit
+            )
+        }
+    }
+
+    func rememberConversation(
+        userRequest: String,
+        assistantResult: String,
+        commandPlan: WorkspaceCommandPlan
+    ) {
+        let names = commandPlan.commands.compactMap { command -> String? in
+            switch command {
+            case .focusAgent(let name), .stopAgent(let name), .resumeAgent(let name):
+                return name
+            case .sendPrompt(let name, _):
+                return name
+            default:
+                return nil
+            }
+        }
+        let ids = names.compactMap { session(named: $0)?.id.uuidString }
+        rememberConversation(
+            userRequest: userRequest,
+            assistantResult: assistantResult,
+            referencedAgentIDs: ids,
+            didExecuteAction: !commandPlan.commands.isEmpty
+        )
+    }
+
+    private func prepareConversationRemoval(_ session: AgentSession) {
+        // A newly requested destructive action supersedes any older one. This
+        // prevents a late "confirm" from approving the wrong removal while the
+        // worktree status check is in flight.
+        pendingConversationConfirmation = nil
+        guard let descriptor = session.worktree else {
+            pendingConversationConfirmation = WorkspaceConversationConfirmation(
+                action: .removeAgent(
+                    WorktreeDeletionRequest(
+                        sessionID: session.id,
+                        agentName: session.name,
+                        hasUncommittedChanges: false
+                    )
+                )
+            )
+            return
+        }
+
+        Task {
+            do {
+                let hasChanges = try await worktreeManager.hasUncommittedChanges(descriptor)
+                guard sessions.contains(where: { $0.id == session.id }) else { return }
+                pendingConversationConfirmation = WorkspaceConversationConfirmation(
+                    action: .removeAgent(
+                        WorktreeDeletionRequest(
+                            sessionID: session.id,
+                            agentName: session.name,
+                            hasUncommittedChanges: hasChanges
+                        )
+                    )
+                )
+            } catch {
+                alertState = .message(error.localizedDescription)
+            }
+        }
+    }
+
     /// Runs a parsed line. Returns the plan so the caller can echo what happened.
     @discardableResult
     func run(_ plan: WorkspaceCommandPlan) -> WorkspaceCommandPlan {
+        var executed = plan
+        executed.commands = []
         for command in plan.commands {
-            run(command)
+            if run(command) {
+                executed.commands.append(command)
+            }
         }
-        return plan
+        return executed
     }
 
-    func run(_ command: WorkspaceCommand) {
+    @discardableResult
+    func run(_ command: WorkspaceCommand) -> Bool {
         switch command {
         case .createAgents(let provider, let count):
-            createAgents(provider: provider, count: count)
+            return createAgents(provider: provider, count: count)
+        case .createAgentWithPrompt(let provider, let prompt):
+            return createAgent(provider: provider, initialPrompt: prompt)
         case .focusAgent(let name):
             guard let session = sessions.first(where: {
                 $0.name.caseInsensitiveCompare(name) == .orderedSame
             }) else {
                 alertState = .message("No agent named “\(name)” is on this canvas.")
-                return
+                return false
             }
             revealTerminal(session)
+            return true
+        case .sendPrompt(let name, let prompt):
+            guard let session = sessions.first(where: {
+                $0.name.caseInsensitiveCompare(name) == .orderedSame
+            }) else {
+                alertState = .message("No agent named “\(name)” is on this canvas.")
+                return false
+            }
+            guard let runtime = session.runtime else {
+                alertState = .message(
+                    "\(session.name) isn't running. Relaunch the agent before sending it a prompt."
+                )
+                return false
+            }
+            do {
+                try runtime.submitPrompt(prompt)
+                revealTerminal(session)
+                return true
+            } catch {
+                alertState = .message(error.localizedDescription)
+                return false
+            }
+        case .stopAgent(let name):
+            guard let session = session(named: name) else {
+                alertState = .message("No agent named “\(name)” is on this canvas.")
+                return false
+            }
+            guard session.runtime?.stop() == true else {
+                alertState = .message("\(session.name) is already stopped.")
+                return false
+            }
+            revealTerminal(session)
+            return true
+        case .resumeAgent(let name):
+            guard let session = session(named: name) else {
+                alertState = .message("No agent named “\(name)” is on this canvas.")
+                return false
+            }
+            let resumed = relaunch(session)
+            if resumed { revealTerminal(session) }
+            return resumed
         case .setBackground(let background):
             canvasBackground = background
+            return true
         case .selectTool(let tool):
             activeTool = tool
+            return true
         case .clearDrawings:
             clearAnnotations()
+            return true
         case .resetView:
             resetView()
+            return true
+        }
+    }
+
+    private func session(named name: String) -> AgentSession? {
+        sessions.first {
+            $0.name.caseInsensitiveCompare(name) == .orderedSame
         }
     }
 
@@ -975,7 +1221,13 @@ final class WorkspaceModel: ObservableObject {
 
     func prepareWorktreeDeletion(_ session: AgentSession) {
         guard let descriptor = session.worktree else {
-            sessions.removeAll { $0.id == session.id }
+            alertState = .deleteWorktree(
+                WorktreeDeletionRequest(
+                    sessionID: session.id,
+                    agentName: session.name,
+                    hasUncommittedChanges: false
+                )
+            )
             return
         }
 
@@ -1026,12 +1278,17 @@ final class WorkspaceModel: ObservableObject {
 
     func deleteWorktree(_ request: WorktreeDeletionRequest) {
         alertState = nil
-        guard let session = sessions.first(where: { $0.id == request.sessionID }),
-              let descriptor = session.worktree else {
-            return
+        if pendingConversationConfirmation?.sessionID == request.sessionID {
+            pendingConversationConfirmation = nil
         }
+        guard let session = sessions.first(where: { $0.id == request.sessionID }) else { return }
 
         session.runtime?.stop()
+        guard let descriptor = session.worktree else {
+            sessions.removeAll { $0.id == request.sessionID }
+            if selectedSessionID == request.sessionID { select(nil) }
+            return
+        }
         Task {
             do {
                 try await worktreeManager.removeWorktree(
@@ -1050,6 +1307,8 @@ final class WorkspaceModel: ObservableObject {
 
     func switchProject(_ request: ProjectSwitchRequest) {
         alertState = nil
+        pendingConversationConfirmation = nil
+        recentConversation = []
         for session in sessions {
             session.runtime?.stop()
         }
@@ -1257,9 +1516,9 @@ final class WorkspaceModel: ObservableObject {
                 ? .stopped
                 : (session.isArchived && session.pullRequest?.state == .merged
                     ? .completed
-                    : .failed("The agent worktree no longer exists on disk."))
+                    : .failed("The agent workspace no longer exists on disk."))
         } else {
-            session.status = .failed("This agent does not have an assigned worktree.")
+            session.status = .failed("This agent does not have an isolated workspace.")
         }
         return session
     }

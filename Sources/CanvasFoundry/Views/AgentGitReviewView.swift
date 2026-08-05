@@ -4,12 +4,13 @@ struct AgentGitReviewView: View {
     @ObservedObject var session: AgentSession
     let service: GitReviewService
     let onRepositoryChanged: () -> Void
-    let onPreparePullRequest: () -> Void
+    let onPublishPullRequest: () -> Void
     let onOpenPullRequest: () -> Void
     let onPushPullRequestUpdates: () -> Void
-    /// Re-reads the PR from GitHub so a merge done in the browser shows here.
+    let onMarkPullRequestReady: () -> Void
+    let onSyncPullRequest: () -> Void
+    let onMergePullRequest: () -> Void
     let onRefreshPullRequest: () -> Void
-    /// Guarded worktree deletion for the merged-but-dirty case.
     let onDelete: () -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -24,6 +25,7 @@ struct AgentGitReviewView: View {
     /// File focused in the patch pane; nil shows the whole patch.
     @State private var selectedFile: GitWorkingFile?
     @State private var focusedDiff: String?
+    @State private var isMergeConfirmationPresented = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -31,7 +33,7 @@ struct AgentGitReviewView: View {
             Divider()
 
             if isLoading && snapshot == nil {
-                ProgressView("Inspecting agent worktree…")
+                ProgressView("Inspecting agent changes…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let snapshot {
                 reviewContent(snapshot)
@@ -39,7 +41,7 @@ struct AgentGitReviewView: View {
                 ContentUnavailableView(
                     "Git review unavailable",
                     systemImage: "exclamationmark.triangle",
-                    description: Text(errorMessage ?? "This agent has no readable worktree.")
+                    description: Text(errorMessage ?? "This agent's workspace could not be read.")
                 )
             }
         }
@@ -48,6 +50,12 @@ struct AgentGitReviewView: View {
             // A PR merged in the browser only shows here if we ask GitHub again.
             onRefreshPullRequest()
             await loadReview()
+        }
+        .alert("Merge \(session.name)?", isPresented: $isMergeConfirmationPresented) {
+            Button("Cancel", role: .cancel) {}
+            Button("Squash Merge") { onMergePullRequest() }
+        } message: {
+            Text("This will merge the pull request and complete the agent. Its clean workspace will be removed automatically.")
         }
     }
 
@@ -59,17 +67,17 @@ struct AgentGitReviewView: View {
         HStack(spacing: 12) {
             ProviderLogo(provider: session.provider, size: 16)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Review \(session.name)")
+                Text("Review & Ship \(session.name)")
                     .font(.foundry(size: 13, weight: .semibold))
-                Text(session.worktree?.branchName ?? "No worktree")
-                    .font(.caption.monospaced())
+                Text("\(session.provider.displayName) agent")
+                    .font(.foundry(size: 10.5))
                     .foregroundStyle(.secondary)
             }
             Spacer()
 
             testStatusLabel
 
-            pullRequestControls
+            deliveryControls
 
             Button {
                 runTests()
@@ -77,15 +85,6 @@ struct AgentGitReviewView: View {
                 Label("Run Tests", systemImage: "checkmark.circle")
             }
             .disabled(session.testStatus == .running || session.worktree == nil)
-
-            Button {
-                onRefreshPullRequest()
-                Task { await loadReview() }
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .disabled(isLoading)
-            .help("Refresh review and pull request state")
 
             Button("Done") { dismiss() }
                 .keyboardShortcut(.cancelAction)
@@ -95,28 +94,43 @@ struct AgentGitReviewView: View {
     }
 
     @ViewBuilder
-    private var pullRequestControls: some View {
+    private var deliveryControls: some View {
         if session.isPublishingPullRequest {
             ProgressView()
                 .controlSize(.small)
-                .help("Updating pull request")
+                .help("Updating delivery")
         } else if let pullRequest = session.pullRequest {
-            if isPullRequestMerged {
+            if pullRequest.state == .merged {
                 Label("Merged", systemImage: "checkmark.seal.fill")
                     .font(.foundry(size: 11, weight: .semibold))
                     .foregroundStyle(.purple)
+            } else if pullRequest.isDraft {
+                Button("Ready for Review", action: onMarkPullRequestReady)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+            } else if pullRequest.isReadyToMerge {
+                Button("Merge", action: { isMergeConfirmationPresented = true })
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+            } else if pullRequest.queueState == .behind
+                        || pullRequest.queueState == .conflict {
+                Button("Sync with \(pullRequest.baseBranch)", action: onSyncPullRequest)
             }
-            Button("Open \(pullRequest.displayLabel)", action: onOpenPullRequest)
-            if pullRequest.state == .open {
-                Button("Push Updates", action: onPushPullRequestUpdates)
-            }
+            Button("Open on GitHub", action: onOpenPullRequest)
         } else {
-            Button {
-                dismiss()
-                onPreparePullRequest()
-            } label: {
-                Label("Publish Draft PR", systemImage: "arrow.up.right.square")
-            }
+            Button("Create Pull Request", action: onPublishPullRequest)
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+                .disabled(
+                    snapshot == nil
+                        || snapshot?.commits.isEmpty == true
+                        || snapshot?.workingFiles.isEmpty == false
+                )
+                .help(
+                    snapshot?.workingFiles.isEmpty == false
+                        ? "Commit the reviewed changes first"
+                        : "Create a draft pull request"
+                )
         }
     }
 
@@ -134,8 +148,10 @@ struct AgentGitReviewView: View {
                         if isPullRequestMerged {
                             mergedSection
                         } else {
+                            deliverySummarySection(snapshot)
                             workingChangesSection(snapshot)
                             commitComposerSection(snapshot)
+                            advancedGitSection(snapshot)
                         }
                         branchSection(snapshot)
                         if !testOutput.isEmpty {
@@ -182,6 +198,34 @@ struct AgentGitReviewView: View {
         }
     }
 
+    private func deliverySummarySection(_ snapshot: GitReviewSnapshot) -> some View {
+        reviewSection("DELIVERY") {
+            HStack(spacing: 12) {
+                Label(session.deliveryState.label, systemImage: deliverySymbol)
+                    .font(.foundry(size: 12, weight: .semibold))
+                    .foregroundStyle(deliveryColor)
+                Spacer()
+                Text("\(snapshot.files.count) changed file\(snapshot.files.count == 1 ? "" : "s")")
+                    .font(.foundry(size: 10.5))
+                    .foregroundStyle(.secondary)
+            }
+
+            if let pullRequest = session.pullRequest {
+                Text("PR #\(pullRequest.number) · \(pullRequest.queueState.label)")
+                    .font(.foundry(size: 11))
+                    .foregroundStyle(.secondary)
+            } else if !snapshot.workingFiles.isEmpty {
+                Text("Review the diff, commit all changes, then create the pull request above.")
+                    .font(.foundry(size: 11))
+                    .foregroundStyle(.secondary)
+            } else if !snapshot.commits.isEmpty {
+                Text("The branch is committed and ready to become a pull request.")
+                    .font(.foundry(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var worktreeStillOnDisk: Bool {
         guard let path = session.worktree?.worktreeURL.path else { return false }
         return FileManager.default.fileExists(atPath: path)
@@ -201,7 +245,7 @@ struct AgentGitReviewView: View {
                 .foregroundStyle(.purple)
 
                 if worktreeStillOnDisk {
-                    Text("The worktree was kept because it still has uncommitted changes. Deleting it discards them permanently.")
+                    Text("The agent was kept because it still has uncommitted changes. Deleting it discards them permanently.")
                         .font(.foundry(size: 10.5))
                         .foregroundStyle(.secondary)
 
@@ -209,13 +253,13 @@ struct AgentGitReviewView: View {
                         dismiss()
                         onDelete()
                     } label: {
-                        Label("Delete Worktree…", systemImage: "trash")
+                        Label("Delete Agent…", systemImage: "trash")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.purple)
                 } else {
-                    Text("Worktree removed and agent archived. Start the next task with a fresh agent — it will branch from the merged code.")
+                    Text("Agent completed and its isolated workspace was cleaned up. New agents will start from the merged code.")
                         .font(.foundry(size: 10.5))
                         .foregroundStyle(.secondary)
                 }
@@ -230,27 +274,10 @@ struct AgentGitReviewView: View {
     private func workingChangesSection(_ snapshot: GitReviewSnapshot) -> some View {
         reviewSection("WORKING CHANGES") {
             if snapshot.workingFiles.isEmpty {
-                Text("Worktree is clean — everything is committed.")
+                Text("Everything is committed.")
                     .font(.foundry(size: 11))
                     .foregroundStyle(.secondary)
             } else {
-                HStack {
-                    Button("Stage All") { runStaging { try await service.stageAll(in: $0) } }
-                        .disabled(isStaging || snapshot.workingFiles.allSatisfy(\.isFullyStaged))
-                    Button("Unstage All") {
-                        let paths = snapshot.workingFiles
-                            .filter(\.hasStagedChanges)
-                            .map(\.path)
-                        runStaging { try await service.unstage(paths, in: $0) }
-                    }
-                    .disabled(isStaging || !snapshot.workingFiles.contains(where: \.hasStagedChanges))
-                    Spacer()
-                    Text("\(snapshot.workingFiles.filter(\.hasStagedChanges).count) staged")
-                        .font(.foundry(size: 10))
-                        .foregroundStyle(.secondary)
-                }
-                .controlSize(.small)
-
                 ForEach(snapshot.workingFiles) { file in
                     workingFileRow(file)
                 }
@@ -260,26 +287,6 @@ struct AgentGitReviewView: View {
 
     private func workingFileRow(_ file: GitWorkingFile) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Toggle(
-                "",
-                isOn: Binding(
-                    get: { file.isFullyStaged },
-                    set: { shouldStage in
-                        runStaging {
-                            if shouldStage {
-                                try await service.stage([file.path], in: $0)
-                            } else {
-                                try await service.unstage([file.path], in: $0)
-                            }
-                        }
-                    }
-                )
-            )
-            .toggleStyle(.checkbox)
-            .labelsHidden()
-            .disabled(isStaging)
-            .help(file.isFullyStaged ? "Unstage" : "Stage")
-
             Button {
                 focus(on: file)
             } label: {
@@ -308,6 +315,35 @@ struct AgentGitReviewView: View {
         }
     }
 
+    private func advancedGitSection(_ snapshot: GitReviewSnapshot) -> some View {
+        DisclosureGroup("Advanced Git controls") {
+            HStack {
+                Button("Stage All") {
+                    runStaging { try await service.stageAll(in: $0) }
+                }
+                .disabled(isStaging || snapshot.workingFiles.allSatisfy(\.isFullyStaged))
+
+                Button("Unstage All") {
+                    let paths = snapshot.workingFiles
+                        .filter(\.hasStagedChanges)
+                        .map(\.path)
+                    runStaging { try await service.unstage(paths, in: $0) }
+                }
+                .disabled(
+                    isStaging
+                        || !snapshot.workingFiles.contains(where: \.hasStagedChanges)
+                )
+                Spacer()
+                Text("\(snapshot.workingFiles.filter(\.hasStagedChanges).count) staged")
+                    .foregroundStyle(.secondary)
+            }
+            .font(.foundry(size: 10.5))
+            .controlSize(.small)
+            .padding(.top, 8)
+        }
+        .font(.foundry(size: 10.5, weight: .medium))
+    }
+
     private func statusColor(for file: GitWorkingFile) -> Color {
         switch file.statusLabel {
         case "untracked", "added": .green
@@ -320,7 +356,6 @@ struct AgentGitReviewView: View {
     // MARK: - Commit composer
 
     private func commitComposerSection(_ snapshot: GitReviewSnapshot) -> some View {
-        let stagedFiles = snapshot.workingFiles.filter(\.hasStagedChanges)
         return reviewSection("COMMIT") {
             if snapshot.workingFiles.isEmpty {
                 EmptyView()
@@ -344,12 +379,9 @@ struct AgentGitReviewView: View {
 
                 HStack {
                     Button {
-                        // Describe what will actually be committed: the staged
-                        // set, or everything if nothing is staged yet.
-                        let described = stagedFiles.isEmpty
-                            ? snapshot.workingFiles
-                            : stagedFiles
-                        commitMessage = CommitMessageComposer.compose(for: described)
+                        commitMessage = CommitMessageComposer.compose(
+                            for: snapshot.workingFiles
+                        )
                     } label: {
                         Label("Generate", systemImage: "wand.and.stars")
                     }
@@ -365,9 +397,7 @@ struct AgentGitReviewView: View {
                             ProgressView().controlSize(.small)
                         } else {
                             Label(
-                                stagedFiles.isEmpty
-                                    ? "Stage All & Commit"
-                                    : "Commit \(stagedFiles.count) File\(stagedFiles.count == 1 ? "" : "s")",
+                                "Commit All Changes",
                                 systemImage: "checkmark.seal"
                             )
                         }
@@ -393,7 +423,7 @@ struct AgentGitReviewView: View {
         let workingPaths = Set(snapshot.workingFiles.map(\.path))
         let committed = snapshot.files.filter { !workingPaths.contains($0.path) }
         return reviewSection(
-            "ON THIS BRANCH · \(snapshot.commits.count) COMMIT\(snapshot.commits.count == 1 ? "" : "S")"
+            "COMMITS · \(snapshot.commits.count)"
         ) {
             if snapshot.commits.isEmpty {
                 Text("No commits yet — stage and commit above, then publish the draft PR.")
@@ -513,7 +543,7 @@ struct AgentGitReviewView: View {
     @MainActor
     private func loadReview() async {
         guard let descriptor = session.worktree else {
-            errorMessage = "This agent has no worktree."
+            errorMessage = "This agent has no isolated workspace."
             return
         }
         isLoading = true
@@ -523,6 +553,10 @@ struct AgentGitReviewView: View {
             let loaded = try await service.inspect(descriptor)
             snapshot = loaded
             session.gitSummary = loaded.summary
+            if commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !loaded.workingFiles.isEmpty {
+                commitMessage = CommitMessageComposer.compose(for: loaded.workingFiles)
+            }
 
             // Keep the focused diff in step with the reloaded state; drop the
             // selection when the file no longer changes anything.
@@ -591,21 +625,22 @@ struct AgentGitReviewView: View {
         guard let descriptor = session.worktree else { return }
         let message = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else { return }
-        let mustStageEverything = !snapshot.workingFiles.contains(where: \.hasStagedChanges)
-
         isCommitting = true
         errorMessage = nil
         actionMessage = nil
         Task {
             defer { isCommitting = false }
             do {
-                if mustStageEverything {
-                    try await service.stageAll(in: descriptor)
-                }
+                try await service.stageAll(in: descriptor)
                 try await service.commit(message: message, in: descriptor)
                 commitMessage = ""
-                actionMessage = "Committed to \(descriptor.branchName). Publish or push the PR to share it."
+                actionMessage = session.pullRequest == nil
+                    ? "Changes committed. This agent is ready to publish."
+                    : "Changes committed. Updating the pull request…"
                 onRepositoryChanged()
+                if session.pullRequest?.state == .open {
+                    onPushPullRequestUpdates()
+                }
                 await loadReview()
             } catch {
                 errorMessage = error.localizedDescription
@@ -633,6 +668,33 @@ struct AgentGitReviewView: View {
                 session.testStatus = .failed(error.localizedDescription)
                 errorMessage = error.localizedDescription
             }
+        }
+    }
+
+    private var deliverySymbol: String {
+        switch session.deliveryState {
+        case .preparing: "gearshape.2"
+        case .working: "bolt.fill"
+        case .changesReady: "doc.badge.ellipsis"
+        case .readyToPublish: "arrow.up.circle.fill"
+        case .publishing: "arrow.triangle.2.circlepath"
+        case .draftPullRequest: "doc.text"
+        case .checksRunning: "clock.fill"
+        case .readyToMerge: "checkmark.circle.fill"
+        case .needsAttention: "exclamationmark.triangle.fill"
+        case .completed: "checkmark.seal.fill"
+        case .idle: "pause.circle"
+        }
+    }
+
+    private var deliveryColor: Color {
+        switch session.deliveryState {
+        case .readyToMerge, .completed: .green
+        case .needsAttention: .red
+        case .changesReady, .readyToPublish, .draftPullRequest, .checksRunning: .orange
+        case .preparing, .publishing: .yellow
+        case .working: .cyan
+        case .idle: .secondary
         }
     }
 

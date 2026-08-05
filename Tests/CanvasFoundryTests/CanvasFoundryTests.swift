@@ -4,6 +4,71 @@ import XCTest
 @testable import CanvasFoundry
 
 final class CanvasFoundryTests: XCTestCase {
+    func testVoiceActivityDetectorEndsAfterSpeechAndSilence() {
+        let detector = LocalVoiceActivityDetector(
+            silenceDuration: 0.8,
+            noSpeechTimeout: 8,
+            maximumDuration: 30,
+            minimumSpeechDuration: 0.12
+        )
+
+        var endpoint: LocalVoiceActivityDetector.Endpoint?
+        for _ in 0..<4 {
+            endpoint = detector.process(decibels: -24, duration: 0.05)?.endpoint ?? endpoint
+        }
+        XCTAssertNil(endpoint)
+        for _ in 0..<7 {
+            endpoint = detector.process(decibels: -70, duration: 0.1)?.endpoint ?? endpoint
+        }
+        XCTAssertNil(endpoint, "a short pause should not submit mid-thought")
+        endpoint = detector.process(decibels: -70, duration: 0.1)?.endpoint ?? endpoint
+        XCTAssertEqual(endpoint, .silence)
+    }
+
+    func testVoiceActivityDetectorTimesOutWhenNothingIsSaid() {
+        let detector = LocalVoiceActivityDetector(
+            silenceDuration: 1,
+            noSpeechTimeout: 1,
+            maximumDuration: 30,
+            minimumSpeechDuration: 0.12
+        )
+
+        var endpoint: LocalVoiceActivityDetector.Endpoint?
+        for _ in 0..<10 {
+            endpoint = detector.process(decibels: -72, duration: 0.1)?.endpoint ?? endpoint
+        }
+        XCTAssertEqual(endpoint, .noSpeech)
+    }
+
+    func testVoiceActivityDetectorIgnoresBriefNoiseAndCapsLongSpeech() {
+        let briefNoise = LocalVoiceActivityDetector(
+            silenceDuration: 0.5,
+            noSpeechTimeout: 2,
+            maximumDuration: 30,
+            minimumSpeechDuration: 0.12
+        )
+        XCTAssertNil(briefNoise.process(decibels: -20, duration: 0.04)?.endpoint)
+        for _ in 0..<10 {
+            XCTAssertNotEqual(
+                briefNoise.process(decibels: -70, duration: 0.1)?.endpoint,
+                .silence,
+                "one click or knock must not count as a spoken command"
+            )
+        }
+
+        let capped = LocalVoiceActivityDetector(
+            silenceDuration: 1,
+            noSpeechTimeout: 10,
+            maximumDuration: 1,
+            minimumSpeechDuration: 0.1
+        )
+        var endpoint: LocalVoiceActivityDetector.Endpoint?
+        for _ in 0..<10 {
+            endpoint = capped.process(decibels: -22, duration: 0.1)?.endpoint ?? endpoint
+        }
+        XCTAssertEqual(endpoint, .maximumDuration)
+    }
+
     func testBundledBrandAssetsAndInterFontsLoad() {
         FoundryBrand.registerBundledFonts()
 
@@ -22,6 +87,22 @@ final class CanvasFoundryTests: XCTestCase {
         XCTAssertEqual(
             AgentProvider.codex.launchPlan(),
             AgentLaunchPlan(executable: "codex", arguments: [])
+        )
+        XCTAssertEqual(
+            AgentProvider.claude.launchPlan(resuming: true),
+            AgentLaunchPlan(executable: "claude", arguments: ["--continue"])
+        )
+        XCTAssertEqual(
+            AgentProvider.codex.launchPlan(resuming: true),
+            AgentLaunchPlan(executable: "codex", arguments: ["resume", "--last"])
+        )
+        XCTAssertEqual(
+            AgentProvider.claude.launchPlan(initialPrompt: "fix the sidebar"),
+            AgentLaunchPlan(executable: "claude", arguments: ["fix the sidebar"])
+        )
+        XCTAssertEqual(
+            AgentProvider.codex.launchPlan(initialPrompt: "run the tests"),
+            AgentLaunchPlan(executable: "codex", arguments: ["run the tests"])
         )
     }
 
@@ -330,6 +411,277 @@ final class CanvasFoundryTests: XCTestCase {
                 "\(spoken) should resolve to Codex"
             )
         }
+    }
+
+    func testVoiceCommandNormalizationCorrectsHighConfidenceDictationArtifacts() {
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("One two more Claude agents").commands,
+            [.createAgents(provider: .claude, count: 2)]
+        )
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse("open two code ex agents").commands,
+            [.createAgents(provider: .codex, count: 2)]
+        )
+
+        // Without “more”, consecutive numbers remain ambiguous. Do not guess
+        // that the speaker corrected themselves.
+        XCTAssertEqual(
+            WorkspaceCommandParser.normalizeSpeechArtifacts(in: "one two Claude agents"),
+            "one two claude agents"
+        )
+    }
+
+    func testVoiceAcknowledgementsAreLocalDeterministicTemplates() {
+        let plan = WorkspaceCommandParser.parse("open two Claude agents")
+        XCTAssertEqual(
+            plan.spokenAcknowledgement,
+            "Opening two Claude agents now."
+        )
+
+        let multi = WorkspaceCommandParser.parse("open one codex agent and reset the view")
+        XCTAssertEqual(
+            multi.spokenAcknowledgement,
+            "Opening one Codex agent now. Resetting the canvas view."
+        )
+    }
+
+    func testVoiceCanRoutePromptsToNamedAgentsWithoutAnLLM() {
+        let names = ["Reese", "Agent 51"]
+        let cases: [(String, WorkspaceCommand)] = [
+            (
+                "say hi to Reese",
+                .sendPrompt(name: "Reese", prompt: "hi")
+            ),
+            (
+                "tell Reese to run the tests",
+                .sendPrompt(name: "Reese", prompt: "run the tests")
+            ),
+            (
+                "ask Agent 51 to inspect and fix the sidebar",
+                .sendPrompt(name: "Agent 51", prompt: "inspect and fix the sidebar")
+            ),
+            (
+                "send to Reese review the current diff",
+                .sendPrompt(name: "Reese", prompt: "review the current diff")
+            )
+        ]
+
+        for (utterance, expected) in cases {
+            let plan = WorkspaceCommandParser.parse(
+                utterance,
+                knownAgentNames: names
+            )
+            XCTAssertEqual(plan.commands, [expected], utterance)
+            XCTAssertTrue(plan.unrecognized.isEmpty, utterance)
+        }
+
+        let greeting = WorkspaceCommandParser.parse(
+            "say hi to Reese",
+            knownAgentNames: names
+        )
+        XCTAssertEqual(greeting.spokenAcknowledgement, "Sending that to Reese.")
+
+        // Unknown targets and empty prompts must not be guessed at.
+        XCTAssertTrue(
+            WorkspaceCommandParser.parse(
+                "say hi to Morgan",
+                knownAgentNames: names
+            ).isEmpty
+        )
+        XCTAssertTrue(
+            WorkspaceCommandParser.parse(
+                "tell Reese",
+                knownAgentNames: names
+            ).isEmpty
+        )
+    }
+
+    func testVoiceCanCreateOneAgentWithAnInitialTask() {
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse(
+                "open a Claude agent to fix the sidebar animation"
+            ).commands,
+            [.createAgentWithPrompt(
+                provider: .claude,
+                prompt: "fix the sidebar animation"
+            )]
+        )
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse(
+                "start a Codex agent to inspect and fix the tests"
+            ).commands,
+            [.createAgentWithPrompt(
+                provider: .codex,
+                prompt: "inspect and fix the tests"
+            )],
+            "a conjunction inside the task must not split into canvas commands"
+        )
+
+        let plan = WorkspaceCommandParser.parse(
+            "open a Claude agent to review the current diff"
+        )
+        XCTAssertEqual(
+            plan.spokenAcknowledgement,
+            "Opening a Claude agent for that now."
+        )
+
+        // A single shared prompt for multiple agents is ambiguous and must not
+        // silently launch idle worktrees or duplicate the same assignment.
+        XCTAssertTrue(
+            WorkspaceCommandParser.parse(
+                "open two Claude agents to fix the sidebar"
+            ).isEmpty
+        )
+    }
+
+    func testVoiceCanStopAndResumeNamedAgents() {
+        let names = ["Reese", "Agent 51"]
+        let cases: [(String, WorkspaceCommand)] = [
+            ("stop Reese", .stopAgent(name: "Reese")),
+            ("pause Agent 51", .stopAgent(name: "Agent 51")),
+            ("resume Reese", .resumeAgent(name: "Reese")),
+            ("restart the agent Agent 51", .resumeAgent(name: "Agent 51")),
+            ("wake Reese", .resumeAgent(name: "Reese"))
+        ]
+
+        for (utterance, expected) in cases {
+            XCTAssertEqual(
+                WorkspaceCommandParser.parse(
+                    utterance,
+                    knownAgentNames: names
+                ).commands,
+                [expected],
+                utterance
+            )
+        }
+
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse(
+                "stop Reese",
+                knownAgentNames: names
+            ).spokenAcknowledgement,
+            "Stopping Reese now."
+        )
+        XCTAssertEqual(
+            WorkspaceCommandParser.parse(
+                "resume Agent 51",
+                knownAgentNames: names
+            ).spokenAcknowledgement,
+            "Resuming Agent 51 now."
+        )
+        XCTAssertTrue(
+            WorkspaceCommandParser.parse(
+                "stop Morgan",
+                knownAgentNames: names
+            ).isEmpty
+        )
+    }
+
+    @MainActor
+    func testLifecycleCommandStopsARealRunningPTYAndRejectsDuplicateStop() throws {
+        let session = AgentSession(provider: .claude, name: "Reese", position: .zero)
+        let runtime = try AgentTerminalRuntime(
+            session: session,
+            directory: FileManager.default.temporaryDirectory,
+            executableOverride: URL(fileURLWithPath: "/bin/cat"),
+            argumentsOverride: []
+        )
+        session.runtime = runtime
+        session.status = .needsYou("Waiting for approval")
+
+        let model = inkModel()
+        model.sessions = [session]
+        let stopped = model.run(
+            WorkspaceCommandParser.parse("stop Reese", knownAgentNames: ["Reese"])
+        )
+
+        XCTAssertEqual(stopped.commands, [.stopAgent(name: "Reese")])
+        XCTAssertEqual(session.status, .stopped)
+
+        let duplicate = model.run(.stopAgent(name: "Reese"))
+        XCTAssertFalse(duplicate)
+        guard case .message(let message) = model.alertState else {
+            return XCTFail("Expected an already-stopped explanation")
+        }
+        XCTAssertTrue(message.contains("already stopped"))
+    }
+
+    @MainActor
+    func testResumeCommandRequiresThePreservedWorktree() {
+        let model = inkModel()
+        let session = AgentSession(provider: .codex, name: "Reese", position: .zero)
+        session.status = .stopped
+        model.sessions = [session]
+
+        let resumed = model.run(.resumeAgent(name: "Reese"))
+
+        XCTAssertFalse(resumed)
+        guard case .failed(let message) = session.status else {
+            return XCTFail("Expected the missing-worktree failure")
+        }
+        XCTAssertTrue(message.contains("isolated workspace"))
+    }
+
+    func testInitialAgentPromptIsSanitizedAndProducesTheTaskSlug() {
+        let normalized = AgentTerminalRuntime.normalizedPrompt(
+            "  Fix sidebar\u{1b}\n animation  "
+        )
+        XCTAssertEqual(normalized, "Fix sidebar animation")
+        XCTAssertEqual(
+            GitWorktreeManager.slug(normalized),
+            "fix-sidebar-animation"
+        )
+    }
+
+    @MainActor
+    func testTargetedPromptWritesOneSanitizedLineToTheAgentPTY() async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CanvasFoundryPrompt-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+
+        let captureURL = scratch.appendingPathComponent("prompt.txt")
+        let session = AgentSession(provider: .claude, name: "Reese", position: .zero)
+        let runtime = try AgentTerminalRuntime(
+            session: session,
+            directory: scratch,
+            executableOverride: URL(fileURLWithPath: "/bin/sh"),
+            argumentsOverride: [
+                "-c",
+                "IFS= read -r line; printf '%s' \"$line\" > \"$1\"",
+                "capture-prompt",
+                captureURL.path
+            ]
+        )
+
+        try runtime.submitPrompt("say hello\u{1b}\nthen run tests")
+        for _ in 0..<100 where !FileManager.default.fileExists(atPath: captureURL.path) {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+
+        let captured = try String(contentsOf: captureURL, encoding: .utf8)
+        XCTAssertEqual(captured, "say hello then run tests")
+        XCTAssertThrowsError(try runtime.submitPrompt("another prompt")) { error in
+            guard case AgentTerminalError.processNotRunning = error else {
+                return XCTFail("Expected a stopped-process error, got \(error)")
+            }
+        }
+    }
+
+    @MainActor
+    func testTargetedPromptExplainsWhenTheRestoredAgentIsNotRunning() {
+        let model = inkModel()
+        let reese = AgentSession(provider: .claude, name: "Reese", position: .zero)
+        reese.status = .stopped
+        model.sessions = [reese]
+
+        model.run(.sendPrompt(name: "Reese", prompt: "say hi"))
+
+        guard case .message(let message) = model.alertState else {
+            return XCTFail("Expected a lifecycle explanation")
+        }
+        XCTAssertTrue(message.contains("isn't running"))
+        XCTAssertTrue(message.contains("Relaunch"))
     }
 
     func testCommandBarRefusesRunawayAndAmbiguousRequests() {
@@ -715,20 +1067,19 @@ final class CanvasFoundryTests: XCTestCase {
     }
 
     func testAgentNamesAreUniqueAndFallBackAfterCallSignsAreUsed() {
+        XCTAssertEqual(AgentNameGenerator.names.count, 50)
+
         let firstName = AgentNameGenerator.nextName(existingNames: [])
         let secondName = AgentNameGenerator.nextName(existingNames: [firstName])
 
-        XCTAssertEqual(firstName, "Ada")
-        XCTAssertEqual(secondName, "Grace")
+        XCTAssertTrue(AgentNameGenerator.names.contains(firstName))
+        XCTAssertTrue(AgentNameGenerator.names.contains(secondName))
         XCTAssertNotEqual(firstName, secondName)
 
-        let usedNames = Set([
-            "Ada", "Grace", "Alan", "Margaret", "Linus", "Katherine",
-            "Dennis", "Barbara", "Ken", "Radia", "Edsger", "Frances"
-        ])
+        let usedNames = Set(AgentNameGenerator.names)
         XCTAssertEqual(
             AgentNameGenerator.nextName(existingNames: usedNames),
-            "Agent 13"
+            "Agent 51"
         )
     }
 
@@ -1261,7 +1612,7 @@ final class CanvasFoundryTests: XCTestCase {
         let openSession = AgentSession(provider: .claude, name: "Alan", position: .zero)
         openSession.worktree = dirtyDescriptor
         openSession.pullRequest = {
-            var pullRequest = mergedPR(9)
+            let pullRequest = mergedPR(9)
             return AgentPullRequest(
                 number: pullRequest.number, url: pullRequest.url, state: .open,
                 isDraft: true, headBranch: pullRequest.headBranch,
@@ -1922,5 +2273,378 @@ final class CanvasFoundryTests: XCTestCase {
         XCTAssertEqual(host.frame.origin, .zero)
         XCTAssertEqual(host.hostingView.frame.origin, CGPoint(x: 80, y: -45))
         XCTAssertEqual(host.hostingView.frame.size, CGSize(width: 520, height: 360))
+    }
+
+    @MainActor
+    func testAgentDeliveryStateProvidesOneLinearShippingLifecycle() {
+        let session = AgentSession(
+            provider: .codex,
+            name: "Ada",
+            position: .zero
+        )
+
+        session.status = .working
+        XCTAssertEqual(session.deliveryState, .working)
+
+        session.gitSummary = AgentGitSummary(changedFileCount: 3)
+        XCTAssertEqual(session.deliveryState, .working)
+        XCTAssertTrue(session.canReviewAndShip)
+
+        session.status = .stopped
+        XCTAssertEqual(session.deliveryState, .changesReady)
+
+        session.gitSummary = AgentGitSummary(commitCount: 1)
+        XCTAssertEqual(session.deliveryState, .readyToPublish)
+
+        session.pullRequest = AgentPullRequest(
+            number: 12,
+            url: URL(string: "https://github.com/example/project/pull/12")!,
+            state: .open,
+            isDraft: true,
+            headBranch: "canvas/ada",
+            baseBranch: "main",
+            updatedAt: Date()
+        )
+        XCTAssertEqual(session.deliveryState, .draftPullRequest)
+
+        session.pullRequest = AgentPullRequest(
+            number: 12,
+            url: URL(string: "https://github.com/example/project/pull/12")!,
+            state: .open,
+            isDraft: false,
+            headBranch: "canvas/ada",
+            baseBranch: "main",
+            updatedAt: Date(),
+            mergeability: .mergeable,
+            mergeStateStatus: "CLEAN",
+            checksStatus: .passed
+        )
+        XCTAssertEqual(session.deliveryState, .readyToMerge)
+    }
+
+    func testLocalPlannerRequestUsesStrictSchemaAndLocalEndpointPayload() throws {
+        let planner = LocalActionPlanner(model: "test-model")
+        let context = LocalFoundryWorkspaceContext(
+            projectName: "Acme",
+            selectedAgentID: nil,
+            agents: [],
+            recentConversation: [
+                LocalFoundryConversationTurn(
+                    userRequest: "Review the authentication flow",
+                    assistantResult: "Which agent should handle it?",
+                    referencedAgentNames: [],
+                    didExecuteAction: false
+                )
+            ]
+        )
+
+        let data = try planner.makeRequestBody(
+            input: "remove Reese",
+            context: context
+        )
+        let body = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(body["model"] as? String, "test-model")
+        XCTAssertEqual(body["stream"] as? Bool, false)
+        XCTAssertEqual(body["think"] as? Bool, false)
+        XCTAssertEqual(body["keep_alive"] as? String, LocalActionPlanner.keepAlive)
+
+        let tools = try XCTUnwrap(body["tools"] as? [[String: Any]])
+        let function = try XCTUnwrap(tools.first?["function"] as? [String: Any])
+        XCTAssertEqual(function["name"] as? String, "propose_foundry_plan")
+        let schema = try XCTUnwrap(function["parameters"] as? [String: Any])
+        XCTAssertEqual(schema["additionalProperties"] as? Bool, false)
+        let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+        let actions = try XCTUnwrap(properties["actions"] as? [String: Any])
+        XCTAssertEqual(
+            actions["maxItems"] as? Int,
+            WorkspaceCommandParser.maximumAgentsPerCommand
+        )
+        let messages = try XCTUnwrap(body["messages"] as? [[String: String]])
+        XCTAssertTrue(messages[0]["content"]?.contains("Always call the propose_foundry_plan tool") == true)
+        XCTAssertTrue(messages[1]["content"]?.contains("Review the authentication flow") == true)
+        XCTAssertTrue(messages[1]["content"]?.contains("Which agent should handle it?") == true)
+    }
+
+    func testLocalPlannerContextKeepsOnlyNamedOrSelectedAgentWhenPossible() {
+        let reese = LocalFoundryAgentContext(
+            id: UUID().uuidString,
+            name: "Reese",
+            provider: "claude",
+            status: "Stopped",
+            isRunning: false,
+            isArchived: false,
+            changedFileCount: 2,
+            commitCount: 0,
+            pullRequestNumber: nil
+        )
+        let grace = LocalFoundryAgentContext(
+            id: UUID().uuidString,
+            name: "Grace Hopper",
+            provider: "codex",
+            status: "Working",
+            isRunning: true,
+            isArchived: false,
+            changedFileCount: 0,
+            commitCount: 0,
+            pullRequestNumber: nil
+        )
+        let agents = [reese, grace]
+
+        XCTAssertEqual(
+            LocalFoundryContextFilter.agents(
+                for: "Remove Reese",
+                selectedAgentID: grace.id,
+                from: agents
+            ),
+            [reese]
+        )
+        XCTAssertEqual(
+            LocalFoundryContextFilter.agents(
+                for: "Stop the selected agent",
+                selectedAgentID: grace.id,
+                from: agents
+            ),
+            [grace]
+        )
+        XCTAssertEqual(
+            LocalFoundryContextFilter.agents(
+                for: "Which agents have changes?",
+                selectedAgentID: grace.id,
+                from: agents
+            ),
+            agents,
+            "fleet-wide questions must retain the full context"
+        )
+    }
+
+    func testInstalledLocalModelProducesAValidRemovalPlanWhenRequested() async throws {
+        guard ProcessInfo.processInfo.environment["FOUNDRY_TEST_LOCAL_MODEL"] == "1" else {
+            throw XCTSkip("Set FOUNDRY_TEST_LOCAL_MODEL=1 to exercise the installed Ollama model.")
+        }
+        let agentHandle = "agent_1"
+        let context = LocalFoundryWorkspaceContext(
+            projectName: "Acme",
+            selectedAgentID: nil,
+            agents: [
+                LocalFoundryAgentContext(
+                    id: agentHandle,
+                    name: "Reese",
+                    provider: "claude",
+                    status: "Stopped",
+                    isRunning: false,
+                    isArchived: false,
+                    changedFileCount: 2,
+                    commitCount: 0,
+                    pullRequestNumber: nil
+                )
+            ]
+        )
+
+        let planner = LocalActionPlanner(
+            model: ProcessInfo.processInfo.environment["FOUNDRY_TEST_LOCAL_MODEL_NAME"]
+                ?? LocalActionPlanner.defaultModel
+        )
+        try await planner.warmUp()
+        let plan: LocalFoundryActionPlan
+        do {
+            let result = try await planner.planWithMetrics(
+                input: "Remove Reese",
+                context: context
+            )
+            plan = result.plan
+            XCTAssertLessThan(
+                result.metrics.loadDuration,
+                0.5,
+                "a prewarmed model should not pay a meaningful load penalty"
+            )
+            XCTAssertGreaterThan(result.metrics.promptTokenCount, 0)
+            XCTAssertLessThan(
+                result.metrics.generatedTokenCount,
+                100,
+                "action plans should stay compact so speech can start quickly"
+            )
+        } catch {
+            var request = URLRequest(url: planner.endpoint)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try planner.makeRequestBody(input: "Remove Reese", context: context)
+            let (data, _) = try await URLSession.shared.data(for: request)
+            XCTFail("Raw Ollama response: \(String(decoding: data, as: UTF8.self))")
+            throw error
+        }
+        XCTAssertEqual(plan.actions.count, 1)
+        XCTAssertEqual(plan.actions[0].type, .prepareRemoveAgent)
+        XCTAssertEqual(plan.actions[0].agentID, agentHandle)
+
+        let runningHandle = "agent_2"
+        let lifecycleContext = LocalFoundryWorkspaceContext(
+            projectName: "Acme",
+            selectedAgentID: nil,
+            agents: context.agents + [
+                LocalFoundryAgentContext(
+                    id: runningHandle,
+                    name: "Grace",
+                    provider: "codex",
+                    status: "Working",
+                    isRunning: true,
+                    isArchived: false,
+                    changedFileCount: 0,
+                    commitCount: 0,
+                    pullRequestNumber: nil
+                )
+            ]
+        )
+        let stopPlan = try await planner.plan(
+            input: "Stop the agent that is currently running",
+            context: lifecycleContext
+        )
+        XCTAssertEqual(stopPlan.actions.count, 1)
+        XCTAssertEqual(stopPlan.actions[0].type, .stopAgent)
+        XCTAssertEqual(stopPlan.actions[0].agentID, runningHandle)
+
+        let followUpContext = LocalFoundryWorkspaceContext(
+            projectName: "Acme",
+            selectedAgentID: nil,
+            agents: context.agents,
+            recentConversation: [
+                LocalFoundryConversationTurn(
+                    userRequest: "Review the authentication flow and fix the refresh race",
+                    assistantResult: "Which agent should handle it?",
+                    referencedAgentNames: [],
+                    didExecuteAction: false
+                )
+            ]
+        )
+        let followUpPlan = try await planner.plan(
+            input: "Send it to Reese",
+            context: followUpContext
+        )
+        XCTAssertEqual(followUpPlan.actions.count, 1)
+        XCTAssertEqual(followUpPlan.actions[0].type, .sendPrompt)
+        XCTAssertEqual(followUpPlan.actions[0].agentID, agentHandle)
+        XCTAssertTrue(followUpPlan.actions[0].prompt?.contains("authentication") == true)
+    }
+
+    @MainActor
+    func testLocalPlannerCanOnlyTargetRealAgentIDsAndRemovalRequiresConfirmation() {
+        let persistence = WorkspacePersistence(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("FoundryLocalPlanner-\(UUID().uuidString).json")
+        )
+        let model = WorkspaceModel(persistence: persistence)
+        let reese = AgentSession(provider: .claude, name: "Reese", position: .zero)
+        reese.status = .stopped
+        model.sessions = [reese]
+
+        let invented = model.run(
+            LocalFoundryActionPlan(
+                response: "I removed Reese.",
+                actions: [
+                    LocalFoundryAction(
+                        type: .prepareRemoveAgent,
+                        agentID: UUID().uuidString
+                    )
+                ]
+            )
+        )
+        XCTAssertFalse(invented.wasHandled)
+        XCTAssertTrue(invented.message.isEmpty)
+        XCTAssertNil(model.alertState)
+        XCTAssertEqual(model.sessions.map(\.id), [reese.id])
+
+        let valid = model.run(
+            LocalFoundryActionPlan(
+                response: "Removing Reese.",
+                actions: [
+                    LocalFoundryAction(
+                        type: .prepareRemoveAgent,
+                        agentID: reese.id.uuidString
+                    )
+                ]
+            )
+        )
+        XCTAssertTrue(valid.wasHandled)
+        XCTAssertEqual(valid.message, "Checking Reese’s workspace before removal.")
+        XCTAssertNil(model.alertState, "voice confirmation must stay non-modal")
+        XCTAssertEqual(
+            model.pendingConversationConfirmation?.prompt,
+            "Remove Reese and its isolated workspace?"
+        )
+        XCTAssertEqual(model.sessions.map(\.id), [reese.id])
+
+        let cancelled = model.runConversationControl(.cancel)
+        XCTAssertEqual(cancelled.message, "Cancelled. Nothing was changed.")
+        XCTAssertNil(model.pendingConversationConfirmation)
+        XCTAssertEqual(model.sessions.map(\.id), [reese.id])
+
+        _ = model.run(
+            LocalFoundryActionPlan(
+                response: "",
+                actions: [
+                    LocalFoundryAction(
+                        type: .prepareRemoveAgent,
+                        agentID: reese.id.uuidString
+                    )
+                ]
+            )
+        )
+        let confirmed = model.runConversationControl(.confirm)
+        XCTAssertEqual(confirmed.message, "Removing Reese now.")
+        XCTAssertNil(model.pendingConversationConfirmation)
+        XCTAssertTrue(model.sessions.isEmpty)
+    }
+
+    func testConversationControlParserKeepsDoThatDistinctFromConfirmation() {
+        XCTAssertEqual(WorkspaceConversationControlParser.parse("Confirm"), .confirm)
+        XCTAssertEqual(WorkspaceConversationControlParser.parse("yes, do it"), .confirm)
+        XCTAssertEqual(WorkspaceConversationControlParser.parse("never mind"), .cancel)
+        XCTAssertEqual(WorkspaceConversationControlParser.parse("do that"), .doThat)
+        XCTAssertNil(WorkspaceConversationControlParser.parse("do that for Reese"))
+    }
+
+    @MainActor
+    func testConversationHistoryIsShortAndRetainsAgentReferences() {
+        let persistence = WorkspacePersistence(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("FoundryConversation-\(UUID().uuidString).json")
+        )
+        let model = WorkspaceModel(persistence: persistence)
+        let reese = AgentSession(provider: .claude, name: "Reese", position: .zero)
+        model.sessions = [reese]
+
+        for index in 0..<6 {
+            model.rememberConversation(
+                userRequest: "request \(index)",
+                assistantResult: "result \(index)",
+                referencedAgentIDs: [reese.id.uuidString],
+                didExecuteAction: index.isMultiple(of: 2)
+            )
+        }
+
+        XCTAssertEqual(model.recentConversation.count, 4)
+        XCTAssertEqual(model.recentConversation.first?.userRequest, "request 2")
+        XCTAssertEqual(model.recentConversation.last?.referencedAgentNames, ["Reese"])
+    }
+
+    @MainActor
+    func testLocalPlannerCanAnswerFromContextWithoutMutatingWorkspace() {
+        let persistence = WorkspacePersistence(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("FoundryLocalAnswer-\(UUID().uuidString).json")
+        )
+        let model = WorkspaceModel(persistence: persistence)
+        let result = model.run(
+            LocalFoundryActionPlan(
+                response: "Two agents are stopped.",
+                actions: [LocalFoundryAction(type: .noAction)]
+            )
+        )
+
+        XCTAssertTrue(result.wasHandled)
+        XCTAssertEqual(result.message, "Two agents are stopped.")
+        XCTAssertTrue(model.sessions.isEmpty)
+        XCTAssertNil(model.alertState)
     }
 }

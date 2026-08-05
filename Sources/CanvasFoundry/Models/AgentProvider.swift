@@ -34,12 +34,20 @@ enum AgentProvider: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    func launchPlan() -> AgentLaunchPlan {
-        switch self {
-        case .claude:
-            AgentLaunchPlan(executable: "claude", arguments: [])
-        case .codex:
-            AgentLaunchPlan(executable: "codex", arguments: [])
+    func launchPlan(
+        resuming: Bool = false,
+        initialPrompt: String? = nil
+    ) -> AgentLaunchPlan {
+        let promptArguments = initialPrompt.map { [$0] } ?? []
+        return switch (self, resuming) {
+        case (.claude, false):
+            AgentLaunchPlan(executable: "claude", arguments: promptArguments)
+        case (.claude, true):
+            AgentLaunchPlan(executable: "claude", arguments: ["--continue"])
+        case (.codex, false):
+            AgentLaunchPlan(executable: "codex", arguments: promptArguments)
+        case (.codex, true):
+            AgentLaunchPlan(executable: "codex", arguments: ["resume", "--last"])
         }
     }
 }

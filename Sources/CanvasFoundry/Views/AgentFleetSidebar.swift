@@ -12,15 +12,6 @@ struct AgentFleetSidebar: View {
                 Text("\(model.visibleSessions.count)")
                     .font(.foundry(size: 10, weight: .medium).monospacedDigit())
                     .foregroundStyle(.secondary)
-                Button {
-                    model.refreshAllGitSummaries()
-                    model.refreshAllPullRequests()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("Refresh Git status")
             }
             .padding(.horizontal, 14)
             .frame(height: 38)
@@ -43,12 +34,11 @@ struct AgentFleetSidebar: View {
                 .padding(20)
             } else {
                 List {
-                    fleetSection("NEEDS YOU", sessions: needsYouSessions)
-                    fleetSection("REVIEW", sessions: reviewSessions)
-                    fleetSection("WORKING", sessions: workingSessions)
-                    fleetSection("STOPPED", sessions: stoppedSessions)
-                    fleetSection("COMPLETED", sessions: completedSessions)
-                    fleetSection("FAILED", sessions: failedSessions)
+                    fleetSection("NEEDS ATTENTION", sessions: attentionSessions)
+                    fleetSection("READY TO SHIP", sessions: readyToShipSessions)
+                    fleetSection("IN PROGRESS", sessions: inProgressSessions)
+                    fleetSection("STOPPED", sessions: idleSessions)
+                    fleetSection("DONE", sessions: completedSessions)
                     fleetSection("ARCHIVED", sessions: archivedSessions, archived: true)
                 }
                 .listStyle(.sidebar)
@@ -78,9 +68,6 @@ struct AgentFleetSidebar: View {
                         onRestore: { model.restore(session) },
                         onReview: { model.review(session) },
                         onOpenInIDE: { model.openAgentWorktree(session, in: $0) },
-                        onPreparePullRequest: { model.preparePullRequest(session) },
-                        onOpenPullRequest: { model.openPullRequest(session) },
-                        onPushPullRequestUpdates: { model.pushPullRequestUpdates(session) },
                         onDelete: { model.prepareWorktreeDeletion(session) }
                     )
                     .listRowBackground(Color.clear)
@@ -94,35 +81,34 @@ struct AgentFleetSidebar: View {
         }
     }
 
-    private var workingSessions: [AgentSession] {
+    private var inProgressSessions: [AgentSession] {
         activeSessions.filter {
-            $0.status.isActive && !isNeedsYou($0.status) && $0.pullRequest?.state != .open
+            $0.deliveryState == .preparing || $0.deliveryState == .working
         }
     }
 
-    private var needsYouSessions: [AgentSession] {
-        activeSessions.filter { isNeedsYou($0.status) }
+    private var attentionSessions: [AgentSession] {
+        activeSessions.filter { $0.deliveryState == .needsAttention }
     }
 
-    private var reviewSessions: [AgentSession] {
+    private var readyToShipSessions: [AgentSession] {
         activeSessions.filter {
-            !isNeedsYou($0.status) && $0.pullRequest?.state == .open
+            switch $0.deliveryState {
+            case .changesReady, .readyToPublish, .publishing, .draftPullRequest,
+                 .checksRunning, .readyToMerge:
+                true
+            default:
+                false
+            }
         }
     }
 
-    private var stoppedSessions: [AgentSession] {
-        activeSessions.filter { $0.status == .stopped && $0.pullRequest?.state != .open }
+    private var idleSessions: [AgentSession] {
+        activeSessions.filter { $0.deliveryState == .idle }
     }
 
     private var completedSessions: [AgentSession] {
-        activeSessions.filter { $0.status == .completed && $0.pullRequest?.state != .open }
-    }
-
-    private var failedSessions: [AgentSession] {
-        activeSessions.filter {
-            if case .failed = $0.status { return $0.pullRequest?.state != .open }
-            return false
-        }
+        activeSessions.filter { $0.deliveryState == .completed }
     }
 
     private var archivedSessions: [AgentSession] {
@@ -133,10 +119,6 @@ struct AgentFleetSidebar: View {
         model.sessions.filter { !$0.isArchived }
     }
 
-    private func isNeedsYou(_ status: AgentStatus) -> Bool {
-        if case .needsYou = status { return true }
-        return false
-    }
 }
 
 private struct FleetAgentRow: View {
@@ -149,9 +131,6 @@ private struct FleetAgentRow: View {
     let onRestore: () -> Void
     let onReview: () -> Void
     let onOpenInIDE: (ProjectIDE) -> Void
-    let onPreparePullRequest: () -> Void
-    let onOpenPullRequest: () -> Void
-    let onPushPullRequestUpdates: () -> Void
     let onDelete: () -> Void
 
     @State private var isRenaming = false
@@ -182,19 +161,13 @@ private struct FleetAgentRow: View {
                     Circle()
                         .fill(statusColor)
                         .frame(width: 5, height: 5)
-                    Text(session.status.label)
+                    Text(session.deliveryState.label)
                         .font(.foundry(size: 9.5))
                         .foregroundStyle(.secondary)
                 }
             }
 
             Spacer(minLength: 2)
-
-            if let pullRequest = session.pullRequest {
-                Text(pullRequest.queueState.label.uppercased())
-                    .font(.foundry(size: 9, weight: .bold))
-                    .foregroundStyle(pullRequestBadgeColor(pullRequest.queueState))
-            }
 
             if session.gitSummary.isRefreshing {
                 ProgressView()
@@ -260,31 +233,22 @@ private struct FleetAgentRow: View {
         Divider()
         Button("Rename", action: beginRename)
         if session.worktree != nil {
-            Button("Review Git Changes", action: onReview)
-            if session.isPublishingPullRequest {
-                Button("Updating Pull Request…") {}
-                    .disabled(true)
-            } else if let pullRequest = session.pullRequest {
-                Button("Open \(pullRequest.displayLabel)", action: onOpenPullRequest)
-                if pullRequest.state == .open {
-                    Button("Push PR Updates", action: onPushPullRequestUpdates)
-                }
-            } else {
-                Button("Publish Draft PR", action: onPreparePullRequest)
-            }
+            Button("Review & Ship", action: onReview)
             ForEach(installedIDEs) { ide in
-                Button("Open Project in \(ide.shortDisplayName)") {
+                Button("Open Agent in \(ide.shortDisplayName)") {
                     onOpenInIDE(ide)
                 }
             }
         }
-        if isArchived {
-            Button("Restore to Canvas", action: onRestore)
-        } else {
-            Button("Archive Agent", action: onArchive)
+        Menu("Advanced") {
+            if isArchived {
+                Button("Restore to Canvas", action: onRestore)
+            } else {
+                Button("Archive Agent", action: onArchive)
+            }
         }
         Divider()
-        Button("Delete Agent and Worktree", role: .destructive, action: onDelete)
+        Button("Delete Agent", role: .destructive, action: onDelete)
             .disabled(session.worktree == nil)
     }
 
@@ -305,22 +269,13 @@ private struct FleetAgentRow: View {
     }
 
     private var statusColor: Color {
-        switch session.status {
-        case .preparing: .yellow
-        case .working: .green
-        case .completed: .cyan
-        case .needsYou: .orange
-        case .stopped: .secondary
-        case .failed: .red
-        }
-    }
-
-    private func pullRequestBadgeColor(_ state: PullRequestQueueState) -> Color {
-        switch state {
-        case .readyToMerge, .merged: .green
-        case .checksFailed, .changesRequested, .conflict: .red
-        case .draft, .checksPending, .reviewRequired, .behind: .orange
-        case .blocked, .closed: .secondary
+        switch session.deliveryState {
+        case .readyToMerge, .completed: .green
+        case .needsAttention: .red
+        case .changesReady, .readyToPublish, .draftPullRequest, .checksRunning: .orange
+        case .preparing, .publishing: .yellow
+        case .working: .cyan
+        case .idle: .secondary
         }
     }
 }

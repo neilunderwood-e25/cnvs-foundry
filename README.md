@@ -28,6 +28,12 @@ The first vertical slice is functional:
 - Collision-aware placement keeps newly opened terminals from covering existing cards.
 - Pixel-stable terminal surfaces keep text crisp and interaction responsive while the canvas pans or zooms.
 - Native AppKit card compositing keeps terminal dragging outside SwiftUI's render loop.
+- One-tap local voice mode detects the end of speech and can create, focus, stop, resume, prompt, or safely prepare removal of agents.
+- Tool-schema-constrained local planning through Ollama handles natural requests beyond the instant deterministic command grammar.
+- The local model prewarms after project selection, stays available for 30 minutes, and receives compact relevant-agent context rather than the full fleet when possible.
+- Four-turn, project-scoped conversational memory supports follow-ups such as “send it to Reese” without repeating the task or agent on every command.
+- Spoken destructive actions use an in-canvas confirmation and automatically listen once for “confirm,” “cancel,” or “do that.”
+- Voice settings prefer installed enhanced or premium macOS voices, with preview and immediate interruption when listening starts.
 - Honest lifecycle states: preparing, working, completed, stopped, and failed.
 - Stop controls and Finder reveal actions.
 
@@ -42,8 +48,47 @@ Canvas Foundry intentionally uses the user's existing CLI authentication. It doe
   - [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
   - [OpenAI Codex CLI](https://github.com/openai/codex)
 - To publish pull requests: [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login`.
+- For intelligent natural-language control: [Ollama](https://ollama.com/) running locally with `qwen3.5:4b`.
 
 ## Run
+
+Voice input requires the privacy metadata of a macOS application bundle. Build
+and launch the local development app with:
+
+```bash
+./Scripts/build-app.sh debug --run
+```
+
+The first microphone click asks for Microphone and Speech Recognition access.
+After one tap, Foundry listens, detects the end of speech locally, submits after
+a natural pause, and speaks the result—no second click or Return is required.
+Recognition is constrained to the on-device macOS recognizer and never silently
+falls back to a cloud service. Clicking the active waveform or pressing Escape
+cancels without executing.
+
+Foundry handles common commands instantly with its built-in grammar. Requests
+outside that grammar are planned locally through Ollama with a strict Foundry
+action schema. Install the default model once with:
+
+```bash
+ollama pull qwen3.5:4b
+```
+
+The model can only propose typed actions against IDs from the current canvas. It
+does not receive shell access. Destructive requests such as “remove Reese” open
+Foundry's in-canvas confirmation, which rechecks the worktree before deletion.
+Foundry speaks the question and listens for a single follow-up, so “confirm,”
+“cancel,” and “do that” work without another button press. Short context is kept
+only for the current project and supports follow-ups such as “send it to Reese.”
+
+Examples include “open two Claude agents”, “say hi to Reese”, “stop Reese”,
+“resume Reese”, and “open a Codex agent to review the current diff”. The last
+form uses the task for the new worktree and branch slug and starts the
+interactive CLI with that initial prompt. Resume reopens the provider's prior
+conversation in the agent's preserved worktree.
+
+For typed-command development that does not need voice, the bare executable is
+still available:
 
 ```bash
 swift run CanvasFoundry
@@ -96,8 +141,10 @@ SwiftUI workspace
 
 ### Milestone 5 — voice and external control
 
-- On-device speech-to-text command surface.
-- Natural-language routing to one agent, a selected group, or the fleet.
+- One-tap, on-device speech-to-text command surface with native spoken feedback. ✓
+- Tool-schema-constrained local language planning for agent control and contextual requests. ✓
+- Natural-language routing to a selected group or the fleet.
+- Downloadable local transcription fallback for languages unsupported by macOS on-device recognition.
 - Local control API and MCP server for external orchestration.
 
 ## Safety boundary

@@ -1,18 +1,27 @@
 import Foundation
 
 enum AgentNameGenerator {
-    private static let callSigns = [
+    static let names = [
         "Ada", "Grace", "Alan", "Margaret", "Linus", "Katherine",
-        "Dennis", "Barbara", "Ken", "Radia", "Edsger", "Frances"
+        "Dennis", "Barbara", "Ken", "Radia", "Edsger", "Frances",
+        "Shannon", "Hedy", "Nikola", "Evelyn", "Donald", "Annie",
+        "Tim", "Brendan", "Guido", "James", "John", "Leslie",
+        "Sophie", "Karen", "Mary", "Jean", "Adele", "Dana",
+        "Robin", "Morgan", "Riley", "Quinn", "Avery", "Jordan",
+        "Casey", "Taylor", "Cameron", "Parker", "Rowan", "Reese",
+        "Sydney", "Blair", "Drew", "Ellis", "Hayden", "Jules",
+        "Remy", "Sasha"
     ]
 
     static func nextName(existingNames: Set<String>) -> String {
-        if let availableName = callSigns.first(where: { !existingNames.contains($0) }) {
+        let usedNames = Set(existingNames.map { $0.lowercased() })
+        let availableNames = names.filter { !usedNames.contains($0.lowercased()) }
+        if let availableName = availableNames.randomElement() {
             return availableName
         }
 
-        var suffix = callSigns.count + 1
-        while existingNames.contains("Agent \(suffix)") {
+        var suffix = names.count + 1
+        while usedNames.contains("agent \(suffix)") {
             suffix += 1
         }
         return "Agent \(suffix)"
@@ -48,6 +57,40 @@ struct AgentGitSummary: Equatable {
     var commitCount = 0
     var isRefreshing = false
     var errorMessage: String?
+}
+
+/// The user-facing lifecycle of an agent's work. Git branches, worktrees and
+/// pull-request synchronization remain implementation details behind this one
+/// delivery state.
+enum AgentDeliveryState: Equatable {
+    case preparing
+    case working
+    case changesReady
+    case readyToPublish
+    case publishing
+    case draftPullRequest
+    case checksRunning
+    case readyToMerge
+    case needsAttention
+    case completed
+    case idle
+
+    var label: String {
+        switch self {
+        case .preparing: "Preparing"
+        case .working: "Working"
+        case .changesReady: "Changes ready"
+        case .readyToPublish: "Ready to publish"
+        case .publishing: "Publishing"
+        case .draftPullRequest: "Draft PR"
+        case .checksRunning: "Checks running"
+        case .readyToMerge: "Ready to merge"
+        case .needsAttention: "Needs attention"
+        case .completed: "Completed"
+        case .idle: "Stopped"
+        }
+    }
+
 }
 
 enum AgentTestStatus: Equatable {
@@ -274,5 +317,44 @@ final class AgentSession: ObservableObject, Identifiable {
         self.position = position
         self.createdAt = Date()
         self.name = name
+    }
+
+    var deliveryState: AgentDeliveryState {
+        if isPublishingPullRequest { return .publishing }
+
+        if let pullRequest {
+            switch pullRequest.queueState {
+            case .merged, .closed:
+                return .completed
+            case .draft:
+                return .draftPullRequest
+            case .checksPending, .reviewRequired, .behind:
+                return .checksRunning
+            case .readyToMerge:
+                return .readyToMerge
+            case .checksFailed, .changesRequested, .conflict, .blocked:
+                return .needsAttention
+            }
+        }
+
+        if status.isActive {
+            return status == .preparing ? .preparing : .working
+        }
+        if gitSummary.changedFileCount > 0 { return .changesReady }
+        if gitSummary.commitCount > 0 { return .readyToPublish }
+
+        switch status {
+        case .preparing: return .preparing
+        case .working: return .working
+        case .completed: return .completed
+        case .needsYou, .failed: return .needsAttention
+        case .stopped: return .idle
+        }
+    }
+
+    var canReviewAndShip: Bool {
+        pullRequest != nil
+            || gitSummary.changedFileCount > 0
+            || gitSummary.commitCount > 0
     }
 }
